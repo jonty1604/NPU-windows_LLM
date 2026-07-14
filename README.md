@@ -1,0 +1,558 @@
+# Intel NPU LLM Server
+
+Run Large Language Models on your Intel Core Ultra NPU with an OpenAI-compatible API.
+
+## 🎯 Features
+
+- **NPU Acceleration**: Leverage Intel's Neural Processing Unit for power-efficient AI
+- **OpenAI-Compatible API**: Works with any OpenAI client (Open WebUI, LangChain, N8N)
+- **Built-in Chat UI**: Beautiful dark-mode interface at `http://localhost:8000` — no Docker needed
+- **Multi-Model Support**: Load and switch between multiple models from the UI
+- **Conversation History**: Full multi-turn context management
+- **Markdown Rendering**: Clean formatting for code blocks, lists, and structured output
+- **Real-time Monitoring**: Live NPU status, memory usage, and system telemetry
+- **Tool Calling**: Function calling support for building AI agents
+- **Local & Private**: All processing happens on your device — nothing leaves your machine
+- **Power Efficient**: ~3-5x less power than CPU inference
+
+## 🎥 Demos
+
+| Quick Overview & Speed Test | Feature Deep Dive |
+| :---: | :---: |
+| [![Intel NPU LLM - UI & Performance Demo](https://img.youtube.com/vi/00RTemT1Bbs/0.jpg)](https://www.youtube.com/watch?v=00RTemT1Bbs) | [![Building with Intel NPU & OpenAI API](https://img.youtube.com/vi/6F6LbR2Xjcg/0.jpg)](https://www.youtube.com/watch?v=6F6LbR2Xjcg) |
+| **Intel NPU LLM - UI & Performance Demo** | **Building with Intel NPU & OpenAI API** |
+
+## 📋 Requirements
+
+- **Processor**: Intel Core Ultra with an Intel NPU / AI Boost device present. Meteor Lake, Arrow Lake, and Lunar Lake are known profiles; newer Core Ultra variants continue with a warning if preflight checks pass.
+- **OS**: Windows 11 (build 22000 or newer)
+- **NPU Driver**: Version 32.0.100.3104 or newer
+- **Python**: 3.11 (managed via Miniconda)
+- **Docker Desktop**: For Open WebUI frontend (optional)
+
+## 🧠 Conversation History, Memory & Continual Training
+
+This server now *learns from use* and keeps your chats across refreshes.
+
+- **Cross-session history** — every turn is persisted server-side to
+  `intel-npu-llm/conversations/` and mirrored to the browser's `localStorage`. Refresh the
+  page (or reopen it) and the chat is restored; switch between past chats from the **💬 History**
+  sidebar. The "Context Retained" banner is now real.
+- **Per-conversation memory** — when a chat outgrows the context window, the dropped turns
+  are summarized (by the most capable loaded model) into structured long-term memory scoped
+  to *that* conversation, shown in the **🧠 Memory** sidebar. Memory is injected back only
+  where it belongs, and you can view/clear it.
+- **Continual training** — Intel NPU is inference-only, so training runs on CPU (your 32 GB
+  RAM): conversations → LoRA fine-tune (`train/finetune_lora.py`) → merged into the base
+  weights → recompiled to NPU `sym_int4` (`train/merge.py`). The base model stays immutable;
+  trained variants are versioned under `adapters/` and enabled per-model via
+  `models.json` `active_adapter`. See **`MULTI_MODEL.md`** for budgets.
+- **API-key auth** — set `API_KEY` to protect the OpenAI-compatible endpoints when you expose
+  the server to your broader architecture (the local UI stays open).
+
+```bat
+:: 1) Collect chats via the UI, then build a clean dataset
+conda activate ipex-npu
+python intel-npu-llm\train\prepare_dataset.py
+
+:: 2) Fine-tune a LoRA on CPU (target a small/medium model)
+python intel-npu-llm\train\finetune_lora.py --model qwen2.5-3b
+
+:: 3) Merge + compile to NPU, then deploy
+python intel-npu-llm\train\merge.py --model qwen2.5-3b --variant v<timestamp> --set-active
+```
+
+> Quality filtering in `prepare_dataset.py` is mandatory — training on junk chat logs
+> degrades the model. Review `train/data/train_sharegpt.jsonl` before training.
+
+## 🚀 Quick Start
+
+### 1. Install Dependencies (First Time Only)
+
+The easiest way is to run the included setup script — it handles Miniconda, the conda
+environment, and all Python packages automatically:
+
+```bat
+.\setup.bat
+```
+
+> **What it does:** Installs Miniconda if missing, creates the `ipex-npu` conda
+> environment (Python 3.11), installs `ipex-llm[npu]` and all server dependencies,
+> and optionally saves a HuggingFace token. Each step is skipped if already complete —
+> safe to re-run after failures.
+
+> **Hardware preflight:** `setup.bat` now checks Windows build, CPU family, Intel NPU
+> driver version, and any blocked BIOS versions listed in `setup/compatibility.json`
+> before it installs anything.
+
+Optional setup overrides:
+```powershell
+.\setup.bat -AllowUnsupportedHardware
+.\setup.bat -SkipDriverCheck
+.\setup.bat -EnvName my-ipex-npu
+```
+
+Support and validation tools:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup\collect_support_info.ps1
+powershell -ExecutionPolicy Bypass -File .\setup\test_compatibility_matrix.ps1
+```
+
+> **Note:** If Miniconda is installed for the first time, the script will ask you to
+> close and reopen the terminal, then run `.\setup.bat` again to finish.
+
+<details>
+<summary>Manual setup (advanced)</summary>
+
+```powershell
+# Install Miniconda (if not installed)
+winget install Anaconda.Miniconda3
+# Reopen terminal, then:
+
+conda create -n ipex-npu python=3.11 -y
+conda activate ipex-npu
+
+pip install --pre --upgrade ipex-llm[npu]
+pip install -r intel-npu-llm/requirements.txt
+```
+
+</details>
+
+### 1b. HuggingFace Authentication (For Gated Models)
+
+Some models (Llama 2, Llama 3, Llama 3.2) require HuggingFace authentication.
+`setup.bat` prompts for this automatically. To set it up manually:
+
+1. **Create a HuggingFace account** at [huggingface.co](https://huggingface.co)
+2. **Accept the model license** - Visit the model page (e.g., [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)) and accept the terms
+3. **Generate an access token** at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+4. Run the token setup script:
+
+```bat
+powershell -ExecutionPolicy Bypass -File .\setup\04_hf_token.ps1
+```
+
+Or create `intel-npu-llm/.env` manually:
+```
+HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+> **Note**: Without this, gated models will fail to download. Non-gated models (Qwen, DeepSeek, MiniCPM, GLM-Edge, Baichuan2) work without authentication.
+
+### 2. Start the NPU Backend (Multiple Models)
+
+```powershell
+# From the project root - loads 1 model by default (qwen1.5-1.8b)
+.\start_server.bat
+
+> **Note**: `start_server.bat` runs the same hardware preflight before startup and
+> auto-configures `IPEX_LLM_NPU_MTL` for known Meteor Lake systems. Unknown/newer
+> Core Ultra generations continue in a generic profile unless preflight blocks them.
+```
+
+Useful startup overrides (PowerShell):
+```powershell
+$env:NPU_CONDA_ENV = 'ipex-npu'
+$env:NPU_ALLOW_UNSUPPORTED = '1'
+$env:NPU_SKIP_DRIVER_CHECK = '1'
+$env:NPU_SKIP_PREFLIGHT = '1'
+.\start_server.bat --list
+```
+
+For bug reports, generate a redacted support bundle:
+```powershell
+.\start_server.bat --diagnose
+```
+
+Or load specific models:
+```powershell
+.\start_server.bat --models "qwen1.5-1.8b,llama3.2-1b,qwen1.5-4b"
+```
+
+List all available models:
+```powershell
+.\start_server.bat --list
+```
+
+Change the server port (if 8000 is occupied):
+```powershell
+.\start_server.bat --port 8001
+```
+
+Mixed usage:
+```powershell
+.\start_server.bat --models "qwen1.5-4b" --port 8080
+```
+
+Or manually:
+```powershell
+$env:IPEX_LLM_NPU_MTL = "1"  # For Meteor Lake (Core Ultra Series 1)
+conda activate ipex-npu
+cd intel-npu-llm
+python npu_server.py
+```
+
+### 3. Start Open WebUI (Optional)
+
+```powershell
+cd intel-npu-llm
+docker compose up -d
+```
+
+### 4. Access the Interface
+
+#### Built-in Chat UI (No Docker Required)
+Open **http://localhost:8000** in your browser for a full-featured chat interface:
+- Real-time NPU status with animated indicators (Connecting, Busy, Idle)
+- Model selector dropdown (loaded models populate automatically)
+- Conversation history with multi-turn context
+- Markdown rendering (code blocks, lists, bold/italic)
+- Keyboard shortcuts: `Enter` to send, `Shift+Enter` for newline, `Ctrl+L` to clear
+- **Live Telemetry**: Real-time NPU busy state, system RAM usage, and model disk footprint (NPU + HuggingFace cache)
+- Live token counter for the entire session
+
+#### API Endpoints
+- `/` — Built-in Chat UI
+- `/v1/chat/completions` — OpenAI Chat Completions API (Open WebUI, LangChain, curl)
+- `/v1/responses` — OpenAI Responses API (N8N)
+- `/v1/models` — List loaded models
+- `/v1/models/load` — Queue a model to load into memory
+- `/v1/models/unload` — Unload a model from memory
+- `/v1/models/delete` — Delete local model caches (HF & NPU)
+- `/v1/system/status` — System telemetry (memory, CPU, NPU busy state)
+- `/health` — Health check
+
+### 5. Connect Your Own Open WebUI (Optional)
+
+If you already have Open WebUI running elsewhere (e.g., on a homelab server), configure it to use your NPU server:
+
+1. **In Open WebUI**: Go to **Settings → Connections → OpenAI API**
+2. **Add a new connection** with these settings:
+   - **API Base URL**: `http://<YOUR-WINDOWS-PC-IP>:8000/v1`
+   - **API Key**: `sk-dummy` (any value works, the NPU server doesn't validate keys)
+3. **Save** and your NPU models will appear in the model dropdown
+
+> **Tip**: Find your Windows IP with `ipconfig` in PowerShell. Use your local network IP (e.g., `192.168.1.x`).
+
+> **Firewall Note**: You may need to allow port 8000 through Windows Firewall for remote connections.
+
+### 6. Connect N8N (Optional)
+
+To use your NPU server with N8N workflows:
+
+1. **In N8N**: Add an **OpenAI** node to your workflow
+2. **Configure credentials**:
+   - **API Key**: `sk-dummy` (any value)
+   - **Base URL**: `http://<YOUR-WINDOWS-PC-IP>:8000/v1`
+3. **Select model**: Use one of the loaded model IDs (e.g., `qwen1.5-1.8b`)
+
+> **Note**: N8N uses the `/v1/responses` API endpoint, which is fully supported.
+
+### 7. Tool Calling / Function Calling (Agents)
+
+The server supports OpenAI-compatible tool/function calling for building AI agents:
+
+```json
+{
+    "model": "qwen2.5-7b",
+    "messages": [{"role": "user", "content": "What's the weather in NYC?"}],
+    "tools": [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"]
+            }
+        }
+    }],
+    "tool_choice": "auto"
+}
+```
+
+#### Tool Choice Options
+
+| `tool_choice` | Behavior |
+|---------------|----------|
+| `"auto"` | Model decides when to use tools (default) |
+| `"none"` | Disable tool calling, respond normally |
+| `"required"` | Force the model to call at least one tool |
+| `{"type": "function", "function": {"name": "get_weather"}}` | Force specific tool |
+
+#### Advanced Features
+
+- **Parallel tool calls**: Model can call multiple tools in one response
+- **Streaming tool calls**: Tool calls are detected and emitted at end of stream
+- **Retry logic**: Malformed tool calls are automatically retried (max 2 attempts)
+- **Tool validation**: Only defined tools are parsed, invalid calls are ignored
+
+**Recommended models**: `qwen2.5-7b`, `qwen2.5-3b` (larger models work better)
+
+> **Note**: Tool calling works best with 3B+ parameter models. Smaller models may struggle.
+
+---
+
+## 🤖 Supported Models
+
+All models below are **officially verified** for Intel NPU via ipex-llm:
+
+### Qwen Series (Recommended)
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `qwen1.5-1.8b` | 1.8B | ~8 tok/s | ✅ **Default** - Verified working |
+| `qwen1.5-4b` | 4B | ~5 tok/s | Better quality |
+| `qwen1.5-7b` | 7B | ~3 tok/s | Best Qwen1.5 |
+| `qwen2-1.5b` | 1.5B | ~10 tok/s | Official NPU verified |
+| `qwen2-7b` | 7B | ~3 tok/s | Official NPU verified |
+| `qwen2.5-3b` | 3B | ~8 tok/s | 🔥 **Latest Qwen** |
+| `qwen2.5-7b` | 7B | ~3 tok/s | 🔥 Best Qwen 2.5 |
+
+### Llama Series
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `llama2-7b` | 7B | ~3 tok/s | Classic, requires HF login |
+| `llama3-8b` | 8B | ~2 tok/s | Powerful, requires HF login |
+| `llama3.2-1b` | 1B | ~15 tok/s | ⚡ **Fastest Llama**, requires HF login |
+| `llama3.2-3b` | 3B | ~10 tok/s | Fast & capable, requires HF login |
+
+### DeepSeek R1 (Reasoning)
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `deepseek-1.5b` | 1.5B | ~10 tok/s | Fast reasoning |
+| `deepseek-7b` | 7B | ~3 tok/s | Best reasoning |
+
+### GLM-Edge (Bilingual)
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `glm-edge-1.5b` | 1.5B | ~10 tok/s | Chinese/English bilingual |
+| `glm-edge-4b` | 4B | ~5 tok/s | Larger bilingual model |
+
+### MiniCPM (Ultra-Compact)
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `minicpm-1b` | 1B | ~15 tok/s | Ultra-compact, efficient |
+| `minicpm-2b` | 2B | ~10 tok/s | Small but capable |
+
+### Baichuan2 (Chinese)
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `baichuan2-7b` | 7B | ~3 tok/s | Chinese-focused LLM |
+
+### Load Multiple Models
+
+```powershell
+.\start_server.bat --models "qwen2.5-3b,llama3.2-1b,minicpm-2b"
+```
+
+> **Note**: First run downloads and compiles each model (1-3 min). Subsequent loads are instant from cache.
+
+---
+
+## ⚡ NPU vs CPU/GPU
+
+### Power & Efficiency (Typical)
+| Metric | NPU | CPU | iGPU |
+|--------|-----|-----|------|
+| Power Draw | ~5-10W | 15-45W | 20-35W |
+| Battery Life | Hours | ~1 hour | ~2 hours |
+| Best For | Efficiency, Background Tasks | Fallback | Max Performance, Larger models |
+
+### Performance by Processor Generation (INT8 TOPS)
+| Processor Architecture | NPU TOPS | GPU TOPS | CPU TOPS | Total Platform TOPS |
+|------------------------|----------|----------|----------|---------------------|
+| **Core Ultra Series 1 (Meteor Lake)** *(e.g., Core Ultra 9 185H)* | ~11 TOPS | ~18 TOPS | ~5 TOPS | ~34 TOPS |
+| **Core Ultra Series 2 (Arrow Lake)** | ~13 TOPS | ~18 TOPS | ~5 TOPS | ~36 TOPS |
+| **Core Ultra Series 2 (Lunar Lake)** | 48 TOPS | ~67 TOPS | ~5 TOPS | ~120 TOPS |
+
+---
+
+## 🔧 Configuration
+
+### Environment Variables
+
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `IPEX_LLM_NPU_MTL` | `1` | Required for Meteor Lake (Core Ultra Series 1) |
+| `NPU_CONDA_ENV` | env name | Conda environment that `start_server.bat` activates |
+| `NPU_ALLOW_UNSUPPORTED` | `1` | Continue past preflight failures with warnings |
+| `NPU_SKIP_DRIVER_CHECK` | `1` | Skip only the Intel NPU driver version check |
+| `NPU_SKIP_PREFLIGHT` | `1` | Bypass all startup hardware checks |
+| `HF_HOME` | path | Hugging Face cache directory |
+| `REQUESTS_CA_BUNDLE` | path | Optional custom CA bundle for HTTPS model downloads |
+| `SSL_CERT_FILE` | path | Alternate way to point Python HTTPS clients at a CA bundle |
+| `PORT` | `8001` | Default port for the server |
+
+### Compatibility Data
+
+`setup/compatibility.json` is the repo's compatibility policy file.
+
+- `blockedBiosVersions`: hard blocks specific BIOS/firmware versions.
+- `knownValidatedCombos`: records reported-good CPU / BIOS / driver combinations.
+- `knownProblemCombos`: records reported-bad combinations, either as errors or warnings.
+
+Keep speculative entries out of this file. Add only combinations that came from real machine reports or direct validation.
+
+### Processor-Specific Settings
+
+| Processor Series | Environment Variable |
+|------------------|---------------------|
+| Core Ultra Series 1 (Meteor Lake) | `IPEX_LLM_NPU_MTL=1` |
+| Core Ultra Series 2 (Arrow Lake) | None required |
+| Core Ultra (Lunar Lake) | None required |
+
+---
+
+## 🐛 Troubleshooting
+
+### NPU Not Detected
+1. Check Device Manager → Neural processors → Intel(R) AI Boost
+2. Update NPU driver to latest version
+3. Ensure `IPEX_LLM_NPU_MTL=1` is set for Meteor Lake
+4. Run `.\setup\00_hardware_preflight.ps1` to see the exact compatibility failure
+5. If a BIOS release is known-bad for your machine, add it to `setup/compatibility.json` under `blockedBiosVersions`
+6. Run `.\start_server.bat --diagnose` and attach the generated JSON when reporting an issue
+
+### Generation Hangs
+- First generation takes 1-3 minutes for NPU warmup
+- Subsequent generations are fast (~1 second)
+
+### Port Already in Use
+```powershell
+# Kill existing Python processes
+Get-Process python* | Stop-Process -Force
+```
+
+### .env File Encoding Error (`ValueError: embedded null character`)
+This happens when the `.env` file was saved in UTF-16 (the default for PowerShell's `>` redirect).
+
+**Fix**: Re-create the file using the UTF-8 safe command:
+```powershell
+'HF_TOKEN=hf_your_token_here' | Out-File -FilePath .env -Encoding utf8
+```
+Or open the file in Notepad → **File > Save As** → set **Encoding: UTF-8**.
+
+### Hugging Face TLS Error (`SSLCertVerificationError` / `unable to get local issuer certificate`)
+Current setup installs `python-certifi-win32`, which lets Python use the Windows certificate store for Hugging Face downloads.
+
+If your environment was created before this dependency was added:
+1. Re-run `./setup.bat --skip-hf-token`
+2. Or install the fix directly: `conda run -n ipex-npu pip install python-certifi-win32`
+3. If your organization provides a custom CA bundle, set `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE` to that `.pem` file before starting the server
+
+---
+
+## 💾 Model Storage
+
+Models are stored in two locations:
+
+| Location | Contents | Path |
+|----------|----------|------|
+| **HuggingFace Cache** | Original downloaded models | `%USERPROFILE%\.cache\huggingface\hub\` |
+| **NPU Cache** | Compiled NPU-optimized models | `intel-npu-llm\npu_model_cache\` |
+
+> **Tip**: The built-in chat UI at `http://localhost:8000` shows total model disk usage live in the header (disk icon chip).
+
+### Space Usage (Approximate)
+
+| Model Size | HF Cache | NPU Cache | Total |
+|------------|----------|-----------|-------|
+| 1-2B models | ~2-4 GB | ~1-2 GB | ~3-6 GB |
+| 3-4B models | ~6-8 GB | ~2-4 GB | ~8-12 GB |
+| 7-8B models | ~14-16 GB | ~4-8 GB | ~18-24 GB |
+
+---
+
+### 🧹 Cache Management Commands
+
+#### Check How Much Space Caches Are Using
+
+```powershell
+# NPU cache size (compiled models)
+"{0:N2} GB" -f ((Get-ChildItem -Recurse .\intel-npu-llm\npu_model_cache\ -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB)
+
+# HuggingFace cache size (downloaded weights)
+"{0:N2} GB" -f ((Get-ChildItem -Recurse "$env:USERPROFILE\.cache\huggingface\hub\" -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB)
+
+# Both combined
+$npu = (Get-ChildItem -Recurse .\intel-npu-llm\npu_model_cache\ -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB
+$hf  = (Get-ChildItem -Recurse "$env:USERPROFILE\.cache\huggingface\hub\" -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB
+"NPU cache: {0:N2} GB  |  HF cache: {1:N2} GB  |  Total: {2:N2} GB" -f $npu, $hf, ($npu + $hf)
+```
+
+#### Clear NPU Cache (Keeps HF Downloads — Fastest to Rebuild)
+
+```powershell
+# Clear ALL compiled NPU models (recompiles on next run, no re-download needed)
+Remove-Item -Recurse -Force .\intel-npu-llm\npu_model_cache\
+```
+
+#### Clear a Single Model's NPU Cache
+
+```powershell
+# Example: remove only Qwen2.5-7B compiled cache
+Remove-Item -Recurse -Force ".\intel-npu-llm\npu_model_cache\Qwen_Qwen2.5-7B-Instruct\"
+
+# List all compiled NPU model folders to find the right name
+Get-ChildItem .\intel-npu-llm\npu_model_cache\
+```
+
+#### Clear HuggingFace Download Cache
+
+> ⚠️ This will force a full re-download on next use. Only do this if you need to free maximum disk space.
+
+```powershell
+# Clear ALL HuggingFace downloads
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface\hub\"
+
+# Clear a specific model from HF cache (example: Qwen2.5-7B)
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface\hub\models--Qwen--Qwen2.5-7B-Instruct\"
+
+# List all downloaded HF models
+Get-ChildItem "$env:USERPROFILE\.cache\huggingface\hub\" -Directory
+```
+
+#### Nuclear Option — Clear Everything
+
+```powershell
+# Remove both NPU compiled cache AND HuggingFace downloads
+Remove-Item -Recurse -Force .\intel-npu-llm\npu_model_cache\ -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface\hub\" -ErrorAction SilentlyContinue
+Write-Host "All model caches cleared. Models will re-download and recompile on next run."
+```
+
+#### Custom Cache Location
+
+Set in your `.env` file to store HuggingFace models on a different drive (great for SSDs with limited C: space):
+
+```
+HF_HOME=D:\models\huggingface
+```
+
+The NPU cache location is fixed at `intel-npu-llm\npu_model_cache\` relative to the project directory.
+
+---
+
+## 📁 Project Structure
+
+```
+npu-windows/
+├── start_server.bat             # One-click startup with auto CPU detection
+├── QUICKSTART.md                 # 5-minute getting started guide
+├── README.md                     # Full documentation
+└── intel-npu-llm/
+    ├── npu_server.py             # NPU-accelerated LLM server (FastAPI)
+    ├── index.html                # Built-in dark-mode chat UI
+    ├── models.json               # Model registry (add custom models here)
+    ├── docker-compose.yml        # Open WebUI frontend (optional)
+    ├── requirements.txt          # Python dependencies
+    ├── .env.example              # Environment variable template
+    └── npu_model_cache/          # Compiled NPU models (auto-created on first run)
+```
+
+---
+
+## 📄 License
+
+MIT License

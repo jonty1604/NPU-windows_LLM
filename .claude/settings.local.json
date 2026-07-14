@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd //c \"cd\")",
+      "Bash(dir \"C:\\\\Users\\\\GajuluGuruPrasad\\\\Downloads\\\\npu-windows-main\\\\npu-windows-main\\\\start_server.bat\")"
+    ]
+  }
+}

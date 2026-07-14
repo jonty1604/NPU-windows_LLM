@@ -1,0 +1,2506 @@
+"""
+Intel NPU LLM Server - Multi-Model Support
+Serves multiple LLMs via OpenAI-compatible API using Intel NPU acceleration.
+"""
+
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
+warnings.filterwarnings("ignore", message=".*pkg_resources.*")
+warnings.filterwarnings("ignore", message=".*resume_download.*")
+
+import argparse
+import importlib.util
+import uvicorn
+import time
+import uuid
+import torch
+import json
+import asyncio
+import os
+import logging
+import psutil
+import re
+import ssl
+import contextlib
+import shutil
+import gc
+import sys
+from pathlib import Path
+from threading import Thread
+from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, FileResponse
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+from dotenv import load_dotenv
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("npu-server")
+
+
+def configure_console_output() -> None:
+    """Prefer UTF-8 console output on Windows to avoid Unicode crashes."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
+
+
+configure_console_output()
+
+
+def configure_https_trust() -> None:
+    """Prefer the Windows certificate store for outbound HTTPS requests."""
+    custom_ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if custom_ca_bundle:
+        logger.info(f"HTTPS trust: using custom CA bundle {custom_ca_bundle}")
+        return
+
+    if os.name != "nt":
+        return
+
+    try:
+        import certifi
+        import certifi_win32  # noqa: F401  # imported for side effects
+
+        patched_ca_bundle = certifi.where()
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", patched_ca_bundle)
+        os.environ.setdefault("SSL_CERT_FILE", patched_ca_bundle)
+        logger.info("HTTPS trust: Windows certificate store via python-certifi-win32")
+    except ImportError:
+        logger.warning(
+            "python-certifi-win32 is not installed. HTTPS model downloads may fail on Windows networks "
+            "that rely on the local machine or enterprise root certificate store."
+        )
+
+
+configure_https_trust()
+
+# Load .env file for HuggingFace token
+def find_and_load_dotenv():
+    """Search for .env in current and parent directories and load it."""
+    # Look for .env in two places:
+    # 1. intel-npu-llm/.env (where the script is)
+    # 2. repo root/.env (where start_backend.bat is)
+    env_paths = [
+        Path(__file__).parent / ".env",
+        Path(__file__).parent.parent / ".env"
+    ]
+    for p in env_paths:
+        if p.exists():
+            logger.info(f"Loading environment from: {p}")
+            load_dotenv(dotenv_path=p)
+            break
+
+find_and_load_dotenv()
+
+# Set HuggingFace token if available
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+if HF_TOKEN:
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    logger.info(f"HuggingFace token loaded (length: {len(HF_TOKEN)})")
+else:
+    logger.warning("No HuggingFace token found. Gated models (Llama) will not work.")
+    logger.info("To use Llama models, create a .env file with: HF_TOKEN=hf_your_token_here")
+
+class RuntimeDependencyError(RuntimeError):
+    """Raised when the Intel NPU Python runtime is missing or incompatible."""
+
+    def __init__(
+        self,
+        message: str,
+        missing_modules: Optional[List[str]] = None,
+        original_exc: Optional[BaseException] = None,
+    ) -> None:
+        super().__init__(message)
+        self.missing_modules = missing_modules or []
+        self.original_exc = original_exc
+
+
+AutoModelForCausalLM = None
+AutoTokenizer = None
+TextIteratorStreamer = None
+runtime_dependency_error: Optional[RuntimeDependencyError] = None
+
+
+def _installed_version(distribution_name: str) -> str:
+    """Return an installed distribution version or 'not installed'."""
+    try:
+        return version(distribution_name)
+    except PackageNotFoundError:
+        return "not installed"
+
+
+def format_runtime_dependency_error(exc: RuntimeDependencyError) -> str:
+    """Return an actionable error message for broken Intel NPU environments."""
+    missing_modules = exc.missing_modules or []
+    requirements_path = Path(__file__).parent / "requirements.txt"
+
+    lines = [
+        "ERROR: Intel NPU Python dependencies are missing or incompatible in the active environment.",
+        f"Python: {sys.executable}",
+        f"ipex-llm: {_installed_version('ipex-llm')}",
+        f"bigdl-core-npu: {_installed_version('bigdl-core-npu')}",
+        f"neural-compressor: {_installed_version('neural-compressor')}",
+        f"setuptools: {_installed_version('setuptools')}",
+    ]
+
+    if missing_modules:
+        lines.append(f"Missing module(s): {', '.join(missing_modules)}")
+
+    if "neural_compressor.adaptor" in missing_modules:
+        lines.extend([
+            "",
+            "This usually means the active 'ipex-npu' environment has an incompatible or partial",
+            "'neural-compressor' / 'ipex-llm' install.",
+            "",
+            "Recommended fix in PowerShell:",
+            "  conda activate ipex-npu",
+            "  python -m pip uninstall -y ipex-llm bigdl-core-npu neural-compressor",
+            "  python -m pip install --pre --upgrade ipex-llm[npu]",
+            f"  python -m pip install -r \"{requirements_path}\"",
+            "  python -c \"import neural_compressor.adaptor; print('Intel NPU runtime OK')\"",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Recommended fix in PowerShell:",
+            "  conda activate ipex-npu",
+            "  python -m pip install --pre --upgrade ipex-llm[npu]",
+            f"  python -m pip install -r \"{requirements_path}\"",
+        ])
+
+    lines.extend([
+        "",
+        "Note: the 'pkg_resources' warning is noisy but not fatal by itself.",
+    ])
+
+    if exc.original_exc:
+        lines.extend([
+            "",
+            f"Original error: {exc.original_exc}",
+        ])
+
+    return "\n".join(lines)
+
+
+WORKING_DIR = Path(os.getcwd())  # Default: current directory, can be changed via API
+
+def _safe_join(base: Path, *parts) -> Path:
+    """Safely join path components, preventing directory traversal attacks."""
+    resolved = (base / Path(*parts)).resolve()
+    if not str(resolved).startswith(str(base.resolve())):
+        raise ValueError(f"Path traversal attempt blocked: {resolved}")
+    return resolved
+
+def _list_files_tool(path: str = ".") -> Dict[str, Any]:
+    """List files/dirs in a directory."""
+    try:
+        target = _safe_join(WORKING_DIR, path)
+        if not target.is_dir():
+            return {"error": f"Not a directory: {path}"}
+        items = []
+        for item in sorted(target.iterdir())[:100]:  # Limit to 100 items
+            items.append({
+                "name": item.name,
+                "type": "dir" if item.is_dir() else "file",
+                "size": item.stat().st_size if item.is_file() else None
+            })
+        return {"path": str(target.relative_to(WORKING_DIR)), "items": items}
+    except Exception as e:
+        return {"error": str(e)}
+
+def _read_file_tool(file_path: str) -> Dict[str, Any]:
+    """Read file contents."""
+    try:
+        target = _safe_join(WORKING_DIR, file_path)
+        if not target.is_file():
+            return {"error": f"Not a file: {file_path}"}
+        content = target.read_text(encoding='utf-8', errors='replace')
+        # Truncate very large files
+        if len(content) > 50000:
+            content = content[:50000] + f"\n... (truncated, {len(content)} chars total)"
+        return {"path": str(target.relative_to(WORKING_DIR)), "content": content}
+    except Exception as e:
+        return {"error": str(e)}
+
+def _write_file_tool(file_path: str, content: str) -> Dict[str, Any]:
+    """Write/create a file."""
+    try:
+        target = _safe_join(WORKING_DIR, file_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding='utf-8')
+        return {"success": True, "path": str(target.relative_to(WORKING_DIR))}
+    except Exception as e:
+        return {"error": str(e)}
+
+def _edit_file_tool(file_path: str, old_str: str, new_str: str) -> Dict[str, Any]:
+    """Replace text in a file (first occurrence only)."""
+    try:
+        target = _safe_join(WORKING_DIR, file_path)
+        if not target.is_file():
+            return {"error": f"Not a file: {file_path}"}
+        content = target.read_text(encoding='utf-8', errors='replace')
+        if old_str not in content:
+            return {"error": "old_str not found in file"}
+        new_content = content.replace(old_str, new_str, 1)
+        target.write_text(new_content, encoding='utf-8')
+        return {"success": True, "path": str(target.relative_to(WORKING_DIR))}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --- Long-term memory helpers (file-backed) ---
+# Global memory lives in memory_store.json. Per-conversation memory lives in
+# conversations/<id>_memory.json so summaries from one chat don't leak into unrelated ones.
+MEMORY_FILE = Path(__file__).parent / "memory_store.json"
+MAX_MEMORY_ENTRIES = 50
+
+
+def _memory_file_for(conversation_id: Optional[str] = None) -> Path:
+    """Return the memory file for a conversation, or the global store when id is None."""
+    if conversation_id:
+        # Reuse the conversation id validation from the conversation store.
+        if not re.fullmatch(r"[A-Za-z0-9_\-]+", conversation_id):
+            raise ValueError("Invalid conversation id")
+        return Path(__file__).parent / "conversations" / f"{conversation_id}_memory.json"
+    return MEMORY_FILE
+
+
+def _load_memory_store(conversation_id: Optional[str] = None):
+    try:
+        path = _memory_file_for(conversation_id)
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        logger.exception("Failed to load memory store")
+    return []
+
+
+def _save_memory_store(entries, conversation_id: Optional[str] = None):
+    try:
+        path = _memory_file_for(conversation_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(entries[-MAX_MEMORY_ENTRIES:], f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("Failed to save memory store")
+
+
+def _pick_summarizer_model_id(preferred: Optional[str] = None) -> Optional[str]:
+    """Pick the most capable loaded model for summarization.
+
+    Prefers the requested model if loaded, else the largest loaded model by a rough
+    size heuristic parsed from the model id (e.g. '7b' > '3b' > '1.8b').
+    """
+    if preferred and preferred in loaded_models:
+        return preferred
+
+    def size_score(mid: str) -> float:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*b", mid.lower())
+        return float(m.group(1)) if m else 0.0
+
+    loaded_ids = list(loaded_models.keys())
+    if not loaded_ids:
+        return None
+    return max(loaded_ids, key=size_score)
+
+
+def _summarize_messages_extractive(messages, char_limit=600):
+    """
+    Lightweight extractive summarization: take first sentence of each message and join.
+    This is cheap and deterministic; can be replaced with model-based summarization later.
+    """
+    pieces = []
+    for m in messages:
+        # messages may be Pydantic objects or dict-like
+        text = getattr(m, 'content', None) if hasattr(m, 'content') else (m.get('content') if isinstance(m, dict) else None)
+        text = (text or '').strip()
+        if not text:
+            continue
+        # naive first-sentence extraction
+        first_sentence = text.split('\n')[0].split('. ')[0].strip()
+        if len(first_sentence) < 10:
+            # fallback to a short prefix
+            first_sentence = text[:120].strip()
+        pieces.append(first_sentence)
+        if sum(len(p) for p in pieces) > char_limit:
+            break
+    summary = '; '.join(pieces)
+    if len(summary) > char_limit:
+        summary = summary[:char_limit].rsplit(' ', 1)[0] + '…'
+    return summary
+
+
+def _append_memory_entry(dropped_messages, model_id=None, conversation_id=None):
+    if not dropped_messages:
+        return
+    try:
+        entries = _load_memory_store(conversation_id)
+        summary = _summarize_messages_extractive(dropped_messages)
+        entry = {
+            "id": str(uuid.uuid4()),
+            "created": int(time.time()),
+            "model": model_id,
+            "conversation_id": conversation_id,
+            "summary": summary,
+            "source_count": len(dropped_messages)
+        }
+        entries.append(entry)
+        _save_memory_store(entries, conversation_id)
+        logger.info(f"Saved memory entry: {entry['id']} ({entry['source_count']} messages)")
+    except Exception:
+        logger.exception("Failed to append memory entry")
+
+
+def _append_memory_summary(summary: str, model_id=None, source_count: int = 0, conversation_id=None):
+    """Append an already-generated summary to the memory store."""
+    try:
+        entries = _load_memory_store(conversation_id)
+        entry = {
+            "id": str(uuid.uuid4()),
+            "created": int(time.time()),
+            "model": model_id,
+            "conversation_id": conversation_id,
+            "summary": summary,
+            "source_count": source_count,
+        }
+        entries.append(entry)
+        _save_memory_store(entries, conversation_id)
+        logger.info(f"Saved memory summary entry: {entry['id']} ({entry['source_count']} messages)")
+    except Exception:
+        logger.exception("Failed to append memory summary")
+
+
+# Structured summarization prompt — captures durable facts, not chatter.
+_SUMMARY_SYSTEM_INSTRUCTION = (
+    "You are a precise memory summarizer for an AI assistant. Read the chat history and "
+    "produce a compact long-term memory note (max 150 words). Use these labeled sections, "
+    "omitting any that are empty:\n"
+    "FACTS: durable facts about the user or task.\n"
+    "DECISIONS: choices made and why.\n"
+    "ENTITIES: named people, files, projects, systems.\n"
+    "OPEN: unresolved questions or next steps.\n"
+    "Do not invent details. Be terse. Output only the note."
+)
+
+
+async def _async_summarize_and_append(dropped_messages, model_id=None, conversation_id=None):
+    """
+    Use the most capable loaded model to summarize dropped messages into structured
+    long-term memory. Runs in the background to avoid blocking request handling.
+    """
+    try:
+        summarizer_id = _pick_summarizer_model_id(model_id)
+        try:
+            model, tokenizer = get_model_and_tokenizer(summarizer_id) if summarizer_id else (None, None)
+        except Exception:
+            model = None
+            tokenizer = None
+
+        # Build a compact summarization prompt
+        convo_text = "\n\n".join([getattr(m, 'content', None) if hasattr(m, 'content') else (m.get('content') if isinstance(m, dict) else '') for m in dropped_messages])
+        convo_text = convo_text.strip()
+        if not convo_text:
+            return
+
+        if model is None or tokenizer is None:
+            # Fallback to extractive summary
+            _append_memory_entry(dropped_messages, model_id, conversation_id)
+            return
+
+        prompt_text = f"<|im_start|>system\n{_SUMMARY_SYSTEM_INSTRUCTION}<|im_end|>\n"
+        prompt_text += f"<|im_start|>user\n{convo_text}<|im_end|>\n<|im_start|>assistant\n"
+
+        input_ids = tokenizer.encode(prompt_text, return_tensors="pt")
+
+        # Acquire model lock and run generation on executor to avoid blocking
+        lock = get_model_lock(summarizer_id)
+        async with lock:
+            def gen():
+                with torch.no_grad():
+                    out = model.generate(input_ids, max_new_tokens=256, do_sample=False, num_beams=1)
+                    return out
+            loop = asyncio.get_running_loop()
+            output_ids = await loop.run_in_executor(None, gen)
+
+        # decode summary and clean
+        summary = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
+        summary = summary.strip()
+        if not summary:
+            # fallback to extractive
+            summary = _summarize_messages_extractive(dropped_messages)
+
+        _append_memory_summary(summary, summarizer_id, len(dropped_messages), conversation_id)
+    except Exception:
+        logger.exception('Async summarization failed, falling back to extractive')
+        try:
+            _append_memory_entry(dropped_messages, model_id, conversation_id)
+        except Exception:
+            logger.exception('Failed to persist extractive memory after summarization failure')
+
+
+async def _get_memory_impl(conversation_id: Optional[str] = None):
+    entries = _load_memory_store(conversation_id)
+    return {"memories": entries}
+
+
+async def _clear_memory_impl(conversation_id: Optional[str] = None):
+    try:
+        _save_memory_store([], conversation_id)
+        return {"status": "cleared"}
+    except Exception:
+        raise HTTPException(status_code=500, detail='Failed to clear memory')
+
+
+# --- Conversation store (server-side canonical store for restore + training) ---
+# Persisted under intel-npu-llm/conversations/<id>.json. This is the source of truth
+# for cross-session restore AND the corpus that feeds the continual-training pipeline.
+CONVERSATIONS_DIR = Path(__file__).parent / "conversations"
+CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+MAX_CONVERSATION_TURNS = 2000  # safety cap on stored turns per conversation
+
+
+def _conversation_path(conv_id: str) -> Path:
+    """Resolve a conversation file path, rejecting anything that isn't a clean id."""
+    if not conv_id or not re.fullmatch(r"[A-Za-z0-9_\-]+", conv_id):
+        raise ValueError("Invalid conversation id")
+    return CONVERSATIONS_DIR / f"{conv_id}.json"
+
+
+def _load_conversation(conv_id: str) -> dict:
+    try:
+        path = _conversation_path(conv_id)
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        logger.exception("Failed to load conversation %s", conv_id)
+    return {}
+
+
+def _save_conversation(conv: dict) -> None:
+    conv_id = conv.get("id")
+    if not conv_id:
+        return
+    try:
+        with open(_conversation_path(conv_id), "w", encoding="utf-8") as f:
+            json.dump(conv, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("Failed to save conversation %s", conv_id)
+
+
+def _list_conversations() -> list:
+    out = []
+    try:
+        for p in sorted(CONVERSATIONS_DIR.glob("*.json")):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                out.append({
+                    "id": data.get("id", p.stem),
+                    "model": data.get("model"),
+                    "created": data.get("created"),
+                    "updated": data.get("updated"),
+                    "turns": len(data.get("messages", [])),
+                    "title": data.get("title", ""),
+                })
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("Failed to list conversations")
+    out.sort(key=lambda c: c.get("updated") or 0, reverse=True)
+    return out
+
+
+def _upsert_conversation(conv_id: str, model: str = None, title: str = None) -> dict:
+    conv = _load_conversation(conv_id)
+    now = int(time.time())
+    if not conv:
+        conv = {"id": conv_id, "model": model, "created": now,
+                "updated": now, "title": title or "", "messages": []}
+    else:
+        if model and not conv.get("model"):
+            conv["model"] = model
+        if title and not conv.get("title"):
+            conv["title"] = title
+        conv["updated"] = now
+    _save_conversation(conv)
+    return conv
+
+
+def _sync_conversation(conv_id: str, messages: list, model: str = None) -> dict:
+    """Store the full message list as the canonical conversation state (idempotent)."""
+    conv = _upsert_conversation(conv_id, model=model)
+    clean = [m for m in (messages or []) if isinstance(m, dict)]
+    if len(clean) > MAX_CONVERSATION_TURNS:
+        clean = clean[-MAX_CONVERSATION_TURNS:]
+    conv["messages"] = clean
+    conv["updated"] = int(time.time())
+    _save_conversation(conv)
+    return conv
+
+
+def _persist_turn(request, assistant_content) -> None:
+    """Persist a completed turn (incoming messages + assistant reply) for a conversation."""
+    conv_id = getattr(request, "conversation_id", None)
+    if not conv_id:
+        return
+    try:
+        msgs = [m.model_dump() for m in request.messages]
+        if assistant_content:
+            msgs.append({"role": "assistant", "content": assistant_content})
+        _sync_conversation(conv_id, msgs, model=request.model)
+    except Exception:
+        logger.exception("Failed to persist conversation turn for %s", conv_id)
+
+
+def ensure_runtime_dependencies(raise_on_error: bool = False) -> bool:
+    """Import and validate the Intel NPU runtime lazily."""
+    global AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, runtime_dependency_error
+
+    if all(obj is not None for obj in (AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer)):
+        return True
+
+    try:
+        required_modules = [
+            "ipex_llm",
+            "transformers",
+            "torch",
+            "neural_compressor",
+            "neural_compressor.adaptor",
+        ]
+        missing_modules = [
+            module_name
+            for module_name in required_modules
+            if importlib.util.find_spec(module_name) is None
+        ]
+        if missing_modules:
+            raise RuntimeDependencyError(
+                "Missing Intel NPU Python modules.",
+                missing_modules=missing_modules,
+            )
+
+        from ipex_llm.transformers.npu_model import AutoModelForCausalLM as _AutoModelForCausalLM
+        from transformers import AutoTokenizer as _AutoTokenizer
+        from transformers import TextIteratorStreamer as _TextIteratorStreamer
+
+        AutoModelForCausalLM = _AutoModelForCausalLM
+        AutoTokenizer = _AutoTokenizer
+        TextIteratorStreamer = _TextIteratorStreamer
+        runtime_dependency_error = None
+        return True
+    except RuntimeDependencyError as exc:
+        runtime_dependency_error = exc
+    except ModuleNotFoundError as exc:
+        runtime_dependency_error = RuntimeDependencyError(
+            "Intel NPU runtime import failed.",
+            missing_modules=[exc.name] if exc.name else [],
+            original_exc=exc,
+        )
+    except ImportError as exc:
+        runtime_dependency_error = RuntimeDependencyError(
+            "Intel NPU runtime import failed.",
+            original_exc=exc,
+        )
+
+    if raise_on_error and runtime_dependency_error is not None:
+        raise SystemExit(format_runtime_dependency_error(runtime_dependency_error))
+
+    return False
+
+
+def print_runtime_summary() -> None:
+    """Print a concise runtime health summary for support/debugging."""
+    print("Intel NPU runtime: OK")
+    print(f"Python: {sys.executable}")
+    print(f"ipex-llm: {_installed_version('ipex-llm')}")
+    print(f"bigdl-core-npu: {_installed_version('bigdl-core-npu')}")
+    print(f"neural-compressor: {_installed_version('neural-compressor')}")
+    print(f"torch: {_installed_version('torch')}")
+    print(f"transformers: {_installed_version('transformers')}")
+
+
+def _is_tls_certificate_error(exc: BaseException) -> bool:
+    """Return True when an exception chain contains a TLS certificate validation failure."""
+    current: Optional[BaseException] = exc
+    seen_ids = set()
+
+    while current is not None and id(current) not in seen_ids:
+        seen_ids.add(id(current))
+        text = f"{type(current).__name__}: {current}"
+        if (
+            "SSLCertVerificationError" in text
+            or "CERTIFICATE_VERIFY_FAILED" in text
+            or "unable to get local issuer certificate" in text
+            or isinstance(current, ssl.SSLCertVerificationError)
+        ):
+            return True
+
+        current = current.__cause__ or current.__context__
+
+    return False
+
+
+def format_model_load_error(exc: BaseException) -> str:
+    """Return a concise, actionable model-load error for UI and logs."""
+    if _is_tls_certificate_error(exc):
+        ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+        bundle_hint = f" Active CA bundle: {ca_bundle}." if ca_bundle else ""
+        return (
+            "HTTPS download failed while contacting huggingface.co. Python could not verify the TLS "
+            "certificate. On Windows, install python-certifi-win32 or set REQUESTS_CA_BUNDLE / "
+            "SSL_CERT_FILE to your organization CA bundle, then retry." + bundle_hint
+        )
+
+    return str(exc)
+
+# --- Available Models Configuration ---
+def load_models_config():
+    """Load model definitions from models.json."""
+    config_path = Path(__file__).parent / "models.json"
+    if config_path.exists():
+        try:
+            # utf-8-sig handles both UTF-8 and UTF-8-with-BOM files (common Windows issue)
+            with open(config_path, "r", encoding="utf-8-sig") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load models.json: {e}")
+    return {}
+
+AVAILABLE_MODELS = load_models_config()
+
+# Module-level defaults (override per model in models.json via "max_context_len" / "max_prompt_len")
+DEFAULT_MAX_CONTEXT_LEN = 1024
+DEFAULT_MAX_PROMPT_LEN = 512
+
+# Named context profiles: (max_context_len, max_prompt_len).
+# NOTE: these values are baked into the NPU compile. Changing a model's profile requires
+# deleting its npu_model_cache/<model>/ folder so it recompiles at next load.
+CONTEXT_PROFILES = {
+    "small":  (1024, 512),
+    "medium": (2048, 1024),
+    "large":  (4096, 2048),
+}
+
+
+def get_model_context_limits(model_id: str) -> tuple[int, int]:
+    """Return (max_context_len, max_prompt_len) for a given model.
+
+    Resolution order: explicit max_context_len/max_prompt_len > named context_profile > defaults.
+    """
+    model_cfg = AVAILABLE_MODELS.get(model_id, {})
+    profile = model_cfg.get("context_profile")
+    prof_ctx, prof_prompt = CONTEXT_PROFILES.get(profile, (DEFAULT_MAX_CONTEXT_LEN, DEFAULT_MAX_PROMPT_LEN))
+    return (
+        model_cfg.get("max_context_len", prof_ctx),
+        model_cfg.get("max_prompt_len", prof_prompt),
+    )
+
+
+def get_model_lock(model_id: str) -> asyncio.Lock:
+    """Return the asyncio lock for a given model, falling back to a shared lock."""
+    return model_locks.get(model_id, npu_resource_lock)
+
+# --- Global State ---
+loaded_models: Dict[str, Any] = {}
+default_model_id = "qwen1.5-1.8b"  # Use the verified working model
+npu_resource_lock = asyncio.Lock()  # Fallback shared lock for safety
+model_locks: Dict[str, asyncio.Lock] = {}
+model_load_tasks: Dict[str, asyncio.Task] = {}
+model_status_overrides: Dict[str, Dict[str, Any]] = {}
+model_load_lock = asyncio.Lock()
+is_generating = False  # Explicit state for tracking
+models_ready = asyncio.Event()
+model_ids_to_load: List[str] = []
+model_loader_task: Optional[asyncio.Task] = None
+
+
+def get_hf_home_dir() -> str:
+    """Return the Hugging Face cache home directory."""
+    return os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+
+
+def get_npu_cache_dir(hf_model_path: str) -> Path:
+    """Return the compiled NPU cache directory for a model."""
+    return Path(NPU_MODEL_CACHE) / hf_model_path.replace("/", "_")
+
+
+def get_hf_repo_dir(hf_model_path: str) -> Path:
+    """Return the Hugging Face repo cache directory for a model."""
+    return Path(get_hf_home_dir()) / "hub" / f"models--{hf_model_path.replace('/', '--')}"
+
+
+def has_npu_cache(hf_model_path: str) -> bool:
+    """Return True if an NPU-compiled cache exists for a model."""
+    cache_dir = get_npu_cache_dir(hf_model_path)
+    try:
+        return cache_dir.exists() and any(cache_dir.iterdir())
+    except OSError:
+        return False
+
+
+def has_hf_cache(hf_model_path: str) -> bool:
+    """Return True if the Hugging Face hub already has cached snapshots for a model."""
+    repo_dir = get_hf_repo_dir(hf_model_path)
+    snapshots_dir = repo_dir / "snapshots"
+    try:
+        return snapshots_dir.exists() and any(snapshots_dir.iterdir())
+    except OSError:
+        return False
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Return total size of a directory or file in bytes."""
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        total = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def _ensure_within_root(path: Path, root: Path) -> tuple[Path, Path]:
+    """Resolve a path and ensure it remains inside the intended root."""
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
+        raise ValueError(f"Refusing to operate outside {resolved_root}")
+    return resolved_path, resolved_root
+
+
+def _delete_path_if_exists(path: Path, root: Path) -> int:
+    """Delete a file or directory if it exists and return freed bytes."""
+    if not path.exists():
+        return 0
+
+    resolved_path, _ = _ensure_within_root(path, root)
+    freed_bytes = _dir_size_bytes(resolved_path)
+
+    if resolved_path.is_dir():
+        shutil.rmtree(resolved_path)
+    else:
+        resolved_path.unlink()
+
+    return freed_bytes
+
+
+def set_model_status(model_id: str, status: str, phase: Optional[str] = None, error: Optional[str] = None) -> None:
+    """Persist a transient model status used by the UI while loading."""
+    model_status_overrides[model_id] = {
+        "status": status,
+        "phase": phase,
+        "error": error,
+        "updated_at": int(time.time())
+    }
+
+
+def clear_model_status(model_id: str) -> None:
+    """Clear any transient status override for a model."""
+    model_status_overrides.pop(model_id, None)
+
+
+def unload_model_from_memory(model_id: str) -> bool:
+    """Unload a loaded model from memory without deleting on-disk caches."""
+    model_bundle = loaded_models.pop(model_id, None)
+    model_locks.pop(model_id, None)
+    clear_model_status(model_id)
+
+    if not model_bundle:
+        return False
+
+    try:
+        del model_bundle["model"]
+        del model_bundle["tokenizer"]
+    except Exception:
+        pass
+
+    gc.collect()
+    return True
+
+
+def get_model_status_label(status: str, phase: Optional[str] = None) -> str:
+    """Return a human-readable label for a model state."""
+    if status == "loaded":
+        return "Loaded"
+    if status == "queued":
+        return "Queued..."
+    if status == "loading":
+        phase_labels = {
+            "download": "Downloading...",
+            "prepare_cache": "Preparing NPU cache...",
+            "load_cache": "Loading cached model...",
+        }
+        return phase_labels.get(phase, "Loading...")
+    if status == "ready_to_load":
+        return "Ready to load"
+    if status == "not_downloaded":
+        return "Download required"
+    if status == "error":
+        return "Load failed"
+    return "Unknown"
+
+
+def get_model_catalog_entry(model_id: str) -> Dict[str, Any]:
+    """Return UI-friendly status metadata for a model."""
+    model_info = AVAILABLE_MODELS.get(model_id, {})
+    hf_id = model_info.get("hf_id", "")
+    override = model_status_overrides.get(model_id, {})
+    task = model_load_tasks.get(model_id)
+    task_running = bool(task and not task.done())
+    compiled_cached = bool(hf_id and has_npu_cache(hf_id))
+    hf_cached = bool(hf_id and has_hf_cache(hf_id))
+
+    if model_id in loaded_models:
+        status = "loaded"
+        phase = None
+    elif override.get("status") == "error":
+        status = "error"
+        phase = override.get("phase")
+    elif task_running:
+        status = override.get("status", "loading")
+        phase = override.get("phase")
+    elif compiled_cached or hf_cached:
+        status = "ready_to_load"
+        phase = None
+    else:
+        status = "not_downloaded"
+        phase = None
+
+    return {
+        "id": model_id,
+        "name": model_info.get("name", model_id),
+        "description": model_info.get("description", ""),
+        "status": status,
+        "status_label": get_model_status_label(status, phase),
+        "phase": phase,
+        "is_loaded": model_id in loaded_models,
+        "is_loading": status in {"queued", "loading"},
+        "is_downloaded": compiled_cached or hf_cached,
+        "has_npu_cache": compiled_cached,
+        "has_hf_cache": hf_cached,
+        "can_unload": model_id in loaded_models and not task_running and not (model_locks.get(model_id).locked() if model_id in model_locks else False),
+        "can_delete": model_id not in loaded_models and status not in {"queued", "loading"} and (compiled_cached or hf_cached),
+        "error": override.get("error"),
+    }
+
+
+async def _load_single_model_task(model_id: str) -> None:
+    """Load one model in the background, serializing heavy model work."""
+    model_info = AVAILABLE_MODELS[model_id]
+    hf_id = model_info["hf_id"]
+
+    try:
+        async with model_load_lock:
+            if model_id in loaded_models:
+                clear_model_status(model_id)
+                return
+
+            if has_npu_cache(hf_id):
+                set_model_status(model_id, "loading", phase="load_cache")
+            elif has_hf_cache(hf_id):
+                set_model_status(model_id, "loading", phase="prepare_cache")
+            else:
+                set_model_status(model_id, "loading", phase="download")
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, load_npu_model, model_id, hf_id)
+            clear_model_status(model_id)
+    except Exception as e:
+        loaded_models.pop(model_id, None)
+        model_locks.pop(model_id, None)
+        user_error = format_model_load_error(e)
+        set_model_status(model_id, "error", phase="error", error=user_error)
+        logger.exception(f"Failed to load model '{model_id}': {user_error}")
+
+
+def schedule_model_load(model_id: str) -> Optional[asyncio.Task]:
+    """Schedule a background load for a model if needed."""
+    if model_id not in AVAILABLE_MODELS:
+        logger.warning(f"Unknown model '{model_id}', skipping.")
+        return None
+
+    if model_id in loaded_models:
+        clear_model_status(model_id)
+        return None
+
+    existing_task = model_load_tasks.get(model_id)
+    if existing_task and not existing_task.done():
+        return existing_task
+
+    set_model_status(model_id, "queued", phase="queued")
+    task = asyncio.create_task(_load_single_model_task(model_id))
+    model_load_tasks[model_id] = task
+    return task
+
+
+async def _load_models_in_background() -> None:
+    """Load configured models without blocking request handling."""
+    loaded_models.clear()
+    model_locks.clear()
+    model_load_tasks.clear()
+    model_status_overrides.clear()
+
+    startup_tasks = [schedule_model_load(model_id) for model_id in model_ids_to_load]
+    startup_tasks = [task for task in startup_tasks if task is not None]
+
+    if startup_tasks:
+        await asyncio.gather(*startup_tasks, return_exceptions=True)
+
+    models_ready.set()
+    logger.info("All models loaded. Server ready.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global model_loader_task
+
+    models_ready.clear()
+    model_loader_task = asyncio.create_task(_load_models_in_background())
+
+    try:
+        yield
+    finally:
+        if model_loader_task and not model_loader_task.done():
+            model_loader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await model_loader_task
+        for task in list(model_load_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        loaded_models.clear()
+        model_locks.clear()
+        model_load_tasks.clear()
+        model_status_overrides.clear()
+        models_ready.clear()
+        logger.info("Models unloaded.")
+
+
+app = FastAPI(title="Intel NPU LLM Server", lifespan=lifespan)
+
+# --- Global generation semaphore (one NPU generation at a time) ---
+# The NPU is a single shared device; running generations for several models concurrently
+# thrashes it. Serialize generations globally while still letting requests queue fairly.
+npu_generation_semaphore = asyncio.Semaphore(1)
+
+# --- Optional API-key auth ---
+# If API_KEY is set, every request except the UI/health/docs must carry a valid key
+# (Authorization: Bearer <key> or x-api-key: <key>). This lets you safely expose the
+# OpenAI-compatible endpoint to your broader architecture. Left unset, behavior is unchanged
+# (any key accepted, matching the prior sk-dummy contract).
+API_KEY = os.environ.get("API_KEY")
+# The built-in UI and its supporting endpoints stay public even when API_KEY is set, so the
+# local chat keeps working. The OpenAI-compatible inference/proxy endpoints (/v1/chat/completions,
+# /v1/responses, /v1/models, /v1/fs) are what get protected when exposed to other systems.
+_PUBLIC_PREFIXES = ("/", "/docs", "/redoc", "/openapi.json", "/health",
+                    "/v1/system/status", "/v1/conversations", "/v1/memory")
+
+
+@app.middleware("http")
+async def auth_middleware(request: "Request", call_next):
+    if not API_KEY:
+        return await call_next(request)
+    path = request.url.path
+    if any(path == p or path.startswith(p + "/") for p in _PUBLIC_PREFIXES):
+        return await call_next(request)
+    auth = request.headers.get("authorization", "")
+    provided = None
+    if auth.lower().startswith("bearer "):
+        provided = auth[7:].strip()
+    else:
+        provided = request.headers.get("x-api-key")
+    if provided and provided == API_KEY:
+        return await call_next(request)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+
+# Register memory endpoints implemented earlier
+app.get('/v1/memory')(_get_memory_impl)
+app.post('/v1/memory/clear')(_clear_memory_impl)
+
+# --- Conversation store endpoints (canonical history for restore + training) ---
+# The handlers below wire the existing conversation-store helpers into the HTTP API.
+# - POST /v1/conversations         : create a new conversation (returns its id)
+# - GET  /v1/conversations         : list all stored conversations
+# - GET  /v1/conversations/{id}    : fetch a single conversation's canonical state
+# - POST /v1/conversations/{id}/messages : replace the canonical message list (idempotent)
+# - DELETE /v1/conversations/{id}  : remove a conversation
+import uuid as _uuid
+
+@app.post('/v1/conversations')
+async def _create_conversation_impl(req: "ConversationCreateRequest"):
+    conv_id = req.id or f"conv_{_uuid.uuid4().hex[:12]}"
+    conv = _upsert_conversation(conv_id, model=req.model, title=req.title)
+    return {"id": conv["id"], "model": conv.get("model"), "title": conv.get("title")}
+
+@app.get('/v1/conversations')
+async def _list_conversations_impl():
+    return {"conversations": _list_conversations()}
+
+@app.get('/v1/conversations/{conv_id}')
+async def _get_conversation_impl(conv_id: str):
+    return _load_conversation(conv_id)
+
+@app.post('/v1/conversations/{conv_id}/messages')
+async def _sync_conversation_impl(conv_id: str, req: "ConversationAppendRequest"):
+    conv = _sync_conversation(conv_id, req.messages, model=req.model)
+    return {"id": conv["id"], "turn_count": len(conv.get("messages", []))}
+
+@app.delete('/v1/conversations/{conv_id}')
+async def _delete_conversation_impl(conv_id: str):
+    path = _conversation_path(conv_id)
+    deleted = path.exists()
+    if deleted:
+        path.unlink()
+    return {"id": conv_id, "deleted": deleted}
+
+
+@app.get("/", response_class=FileResponse)
+async def read_index():
+    """Serve the built-in test UI."""
+    return FileResponse(
+        Path(__file__).parent / "index.html",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+# --- NPU Model Cache Directory ---
+NPU_MODEL_CACHE = os.path.join(os.path.dirname(__file__), "npu_model_cache")
+
+# --- OpenAI API Pydantic Models ---
+class ChatMessage(BaseModel):
+    role: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+
+# --- Tool/Function Calling Models ---
+class FunctionDefinition(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+class ToolDefinition(BaseModel):
+    type: str = "function"
+    function: FunctionDefinition
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: FunctionCall
+
+class StreamOptions(BaseModel):
+    include_usage: Optional[bool] = None
+
+class ModelLoadRequest(BaseModel):
+    model: str
+
+
+class ModelDeleteRequest(BaseModel):
+    model: str
+
+class ModelUnloadRequest(BaseModel):
+    model: str
+
+class ConversationCreateRequest(BaseModel):
+    id: Optional[str] = None
+    model: Optional[str] = None
+    title: Optional[str] = None
+
+
+class ConversationAppendRequest(BaseModel):
+    messages: List[Dict[str, Any]]
+    model: Optional[str] = None
+    assistant: Optional[str] = None
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    conversation_id: Optional[str] = None
+    max_tokens: Optional[int] = 512
+    temperature: Optional[float] = 0.7
+    stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
+    tools: Optional[List[ToolDefinition]] = None
+    tool_choice: Optional[Any] = None  # "auto", "none", or specific tool
+
+class ChatCompletionMessageWithTools(BaseModel):
+    role: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+
+class ChatCompletionResponseChoice(BaseModel):
+    index: int
+    message: ChatCompletionMessageWithTools
+    finish_reason: str
+
+class UsageInfo(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[ChatCompletionResponseChoice]
+    usage: Optional[UsageInfo] = None
+
+# --- OpenAI Responses API Models (for N8N compatibility) ---
+class ResponseInputMessage(BaseModel):
+    role: str
+    content: str
+
+class ResponseRequest(BaseModel):
+    """OpenAI Responses API request format (used by N8N)."""
+    model: str
+    input: Any  # Can be string or list of messages
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = 512
+    temperature: Optional[float] = 0.7
+    stream: Optional[bool] = False
+
+class ResponseOutputMessage(BaseModel):
+    type: str = "message"
+    id: str
+    status: str = "completed"
+    role: str = "assistant"
+    content: List[Dict[str, Any]]
+
+class ResponseObject(BaseModel):
+    """OpenAI Responses API response format."""
+    id: str
+    object: str = "response"
+    created_at: int
+    model: str
+    output: List[ResponseOutputMessage]
+    status: str = "completed"
+
+# --- Built-in File System Tools ---
+def get_builtin_file_tools() -> List[ToolDefinition]:
+    """Return built-in file system tools that are always available."""
+    return [
+        ToolDefinition(
+            type="function",
+            function=FunctionDefinition(
+                name="list_files",
+                description="List files and directories in the working directory or a specified path",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path to list (default: '.')"
+                        }
+                    },
+                    "required": []
+                }
+            )
+        ),
+        ToolDefinition(
+            type="function",
+            function=FunctionDefinition(
+                name="read_file",
+                description="Read the contents of a file",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the file to read"
+                        }
+                    },
+                    "required": ["file_path"]
+                }
+            )
+        ),
+        ToolDefinition(
+            type="function",
+            function=FunctionDefinition(
+                name="write_file",
+                description="Create or overwrite a file with content",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the file to create/write"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "File content"
+                        }
+                    },
+                    "required": ["file_path", "content"]
+                }
+            )
+        ),
+        ToolDefinition(
+            type="function",
+            function=FunctionDefinition(
+                name="edit_file",
+                description="Replace text in a file (first occurrence only)",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to the file to edit"
+                        },
+                        "old_str": {
+                            "type": "string",
+                            "description": "Text to find and replace"
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "Replacement text"
+                        }
+                    },
+                    "required": ["file_path", "old_str", "new_str"]
+                }
+            )
+        ),
+    ]
+
+
+def _execute_builtin_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute a built-in file system tool."""
+    if tool_name == "list_files":
+        return _list_files_tool(args.get("path", "."))
+    elif tool_name == "read_file":
+        return _read_file_tool(args.get("file_path", ""))
+    elif tool_name == "write_file":
+        return _write_file_tool(args.get("file_path", ""), args.get("content", ""))
+    elif tool_name == "edit_file":
+        return _edit_file_tool(args.get("file_path", ""), args.get("old_str", ""), args.get("new_str", ""))
+    else:
+        return {"error": f"Unknown tool: {tool_name}"}
+
+# --- Model Loading ---
+def load_npu_model(model_id: str, hf_model_path: str):
+    """Load a single model with NPU optimization.
+
+    If a trained adapter variant is configured (models.json "active_adapter" pointing at a
+    directory under adapters/<model>/), the merged weights there are used as the source.
+    This is how continually fine-tuned knowledge reaches the NPU (NPU training is unsupported;
+    we LoRA-train on CPU, merge, and recompile).
+    """
+    global loaded_models
+    if not ensure_runtime_dependencies():
+        raise RuntimeError(format_runtime_dependency_error(runtime_dependency_error))
+
+    # Resolve the actual source weights: a trained adapter variant takes precedence.
+    model_cfg = AVAILABLE_MODELS.get(model_id, {})
+    adapter = model_cfg.get("active_adapter")
+    source_hf_id = hf_model_path
+    if adapter:
+        adapter_dir = (Path(__file__).parent / "adapters" / model_id / adapter)
+        if adapter_dir.exists():
+            source_hf_id = str(adapter_dir)
+            logger.info(f"Using trained variant '{adapter}' for '{model_id}': {source_hf_id}")
+        else:
+            logger.warning(f"active_adapter '{adapter}' not found for '{model_id}'; using base model")
+
+    max_context_len, max_prompt_len = get_model_context_limits(model_id)
+
+    logger.info(f"Loading '{model_id}' ({source_hf_id}) for Intel NPU...")
+
+    npu_env = os.environ.get("IPEX_LLM_NPU_MTL", "not set")
+    logger.info(f"NPU Environment: IPEX_LLM_NPU_MTL={npu_env}")
+
+    # Create cache directory for NPU model
+    model_cache_dir = str(get_npu_cache_dir(source_hf_id))
+
+    cache_is_valid = os.path.isfile(os.path.join(model_cache_dir, "config.json"))
+
+    # Context limits are baked into the NPU compile. If the cached model was compiled
+    # with different limits than requested now, invalidate the cache so it recompiles.
+    if cache_is_valid:
+        try:
+            with open(os.path.join(model_cache_dir, "config.json"), "r", encoding="utf-8") as cf:
+                cached_cfg = json.load(cf)
+            cached_ctx = cached_cfg.get("max_context_len") or cached_cfg.get("npu_max_context_len")
+            cached_prompt = cached_cfg.get("max_prompt_len") or cached_cfg.get("npu_max_prompt_len")
+            if cached_ctx is not None and int(cached_ctx) != int(max_context_len):
+                logger.info(f"NPU cache built for max_context_len={cached_ctx}, requested {max_context_len} — recompiling")
+                cache_is_valid = False
+            elif cached_prompt is not None and int(cached_prompt) != int(max_prompt_len):
+                logger.info(f"NPU cache built for max_prompt_len={cached_prompt}, requested {max_prompt_len} — recompiling")
+                cache_is_valid = False
+        except Exception:
+            logger.exception("Failed to inspect cached NPU config; assuming cache is valid")
+
+    if not cache_is_valid:
+        # Create parent directories and convert model
+        os.makedirs(model_cache_dir, exist_ok=True)
+        logger.info(f"Converting model to NPU format (first time only)...")
+        logger.info(f"Cache: {model_cache_dir}")
+        model = AutoModelForCausalLM.from_pretrained(
+            source_hf_id,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+            attn_implementation="eager",
+            load_in_low_bit="sym_int4",
+            optimize_model=True,
+            max_context_len=max_context_len,
+            max_prompt_len=max_prompt_len,
+            save_directory=model_cache_dir
+        )
+        tokenizer = AutoTokenizer.from_pretrained(source_hf_id, trust_remote_code=True)
+        tokenizer.save_pretrained(model_cache_dir)
+        # Persist the compiled context limits so future loads can detect a mismatch.
+        try:
+            with open(os.path.join(model_cache_dir, "config.json"), "r", encoding="utf-8") as cf:
+                _cfg = json.load(cf)
+        except Exception:
+            _cfg = {}
+        _cfg["max_context_len"] = max_context_len
+        _cfg["max_prompt_len"] = max_prompt_len
+        with open(os.path.join(model_cache_dir, "config.json"), "w", encoding="utf-8") as cf:
+            json.dump(_cfg, cf, ensure_ascii=False, indent=2)
+        logger.info(f" -> Model converted and cached.")
+    else:  # cache_is_valid
+        logger.info(f"Loading from cache: {model_cache_dir}")
+        model = AutoModelForCausalLM.load_low_bit(
+            model_cache_dir,
+            attn_implementation="eager"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_cache_dir, trust_remote_code=True)
+        logger.info(f" -> Loaded from cache.")
+    
+    loaded_models[model_id] = {
+        "model": model,
+        "tokenizer": tokenizer,
+        "hf_id": hf_model_path
+    }
+    model_locks[model_id] = asyncio.Lock()
+    logger.info(f" ✓ '{model_id}' ready on Intel NPU!")
+
+def load_all_models(model_ids: List[str]):
+    """Load all specified models at startup."""
+    logger.info(f"Intel NPU LLM Server - Loading {len(model_ids)} Model(s)")
+    
+    for model_id in model_ids:
+        if model_id in AVAILABLE_MODELS:
+            hf_id = AVAILABLE_MODELS[model_id]["hf_id"]
+            load_npu_model(model_id, hf_id)
+        else:
+            logger.warning(f"Unknown model '{model_id}', skipping.")
+    
+    logger.info(f"Total models ready: {len(loaded_models)}")
+
+def get_model_and_tokenizer(model_id: str):
+    """Get model and tokenizer for the given model ID."""
+    # Try exact match
+    if model_id in loaded_models:
+        return loaded_models[model_id]["model"], loaded_models[model_id]["tokenizer"]
+
+    if model_id in AVAILABLE_MODELS:
+        model_entry = get_model_catalog_entry(model_id)
+        if model_entry["is_loading"]:
+            raise HTTPException(status_code=409, detail=f"Model '{model_id}' is still loading")
+        raise HTTPException(status_code=409, detail=f"Model '{model_id}' is not loaded yet")
+    
+    # Fallback to default
+    if default_model_id in loaded_models:
+        return loaded_models[default_model_id]["model"], loaded_models[default_model_id]["tokenizer"]
+    
+    # Use first available
+    if loaded_models:
+        first_key = next(iter(loaded_models))
+        return loaded_models[first_key]["model"], loaded_models[first_key]["tokenizer"]
+    
+    raise HTTPException(status_code=500, detail="No models loaded")
+
+# --- Tool Calling Helpers ---
+def format_tools_for_prompt(tools: List[ToolDefinition], tool_choice: Any = None) -> str:
+    """
+    Format tools into a system prompt section for Qwen.
+    
+    Args:
+        tools: List of tool definitions
+        tool_choice: "auto", "none", "required", or {"type": "function", "function": {"name": "..."}}
+    """
+    if not tools:
+        return ""
+    
+    # Handle tool_choice="none" - don't include tools at all
+    if tool_choice == "none":
+        return ""
+    
+    tools_json = []
+    for tool in tools:
+        tools_json.append({
+            "type": tool.type,
+            "function": {
+                "name": tool.function.name,
+                "description": tool.function.description or "",
+                "parameters": tool.function.parameters or {"type": "object", "properties": {}}
+            }
+        })
+    
+    # Filter to specific tool if tool_choice specifies one
+    forced_tool = None
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        forced_tool = tool_choice.get("function", {}).get("name")
+        if forced_tool:
+            tools_json = [t for t in tools_json if t["function"]["name"] == forced_tool]
+    
+    tools_str = json.dumps(tools_json, indent=2)
+    
+    # Build instruction based on tool_choice
+    if forced_tool:
+        tool_instruction = f"You MUST call the '{forced_tool}' function. Do not respond with anything else."
+    elif tool_choice == "required":
+        tool_instruction = "You MUST call at least one of the available tools. Do not respond without calling a tool."
+    else:  # "auto" or None
+        tool_instruction = "Use the tools when needed to answer the user's questions. If you don't need a tool, respond normally."
+    
+    return f"""You are a helpful assistant with access to the following tools. {tool_instruction}
+
+# Available Tools
+
+{tools_str}
+
+# Tool Call Format
+
+When you need to call a tool, respond with a JSON object in this EXACT format:
+{{"name": "function_name", "arguments": {{"arg1": "value1"}}}}
+
+For multiple tool calls, use a JSON array:
+[{{"name": "func1", "arguments": {{}}}}, {{"name": "func2", "arguments": {{}}}}]
+
+IMPORTANT: Output ONLY the JSON when calling tools, no other text."""
+
+
+def parse_tool_calls(text: str, available_tools: List[ToolDefinition] = None) -> tuple[str, List[ToolCall]]:
+    """
+    Parse tool calls from model output with improved parsing.
+    
+    Features:
+    - Parses single JSON objects
+    - Parses JSON arrays
+    - Handles code blocks
+    - Deduplicates calls
+    - Validates against available tools
+    
+    Returns (remaining_text, list_of_tool_calls).
+    """
+    tool_calls = []
+    seen_calls = set()  # For deduplication
+    remaining_text = text
+    
+    # Get list of valid tool names for validation
+    valid_tool_names = set()
+    if available_tools:
+        valid_tool_names = {t.function.name for t in available_tools}
+    
+    def add_tool_call(name: str, arguments: str, original_match: str = None):
+        """Helper to add a tool call with deduplication."""
+        # Skip if not a valid tool name (when validation is enabled)
+        if valid_tool_names and name not in valid_tool_names:
+            return False
+        
+        # Dedup key
+        dedup_key = f"{name}:{arguments}"
+        if dedup_key in seen_calls:
+            return False
+        seen_calls.add(dedup_key)
+        
+        tool_calls.append(ToolCall(
+            id=f"call-{uuid.uuid4().hex[:12]}",
+            type="function",
+            function=FunctionCall(name=name, arguments=arguments)
+        ))
+        return True
+    
+    # Strategy 1: Try to parse as a full JSON array
+    # Look for [...] patterns
+    array_pattern = r'\[\s*\{[^[\]]*\}\s*(?:,\s*\{[^[\]]*\}\s*)*\]'
+    for match in re.finditer(array_pattern, text, re.DOTALL):
+        try:
+            arr = json.loads(match.group(0))
+            if isinstance(arr, list):
+                valid_array = True
+                for item in arr:
+                    if isinstance(item, dict) and "name" in item:
+                        args = item.get("arguments", {})
+                        args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                        add_tool_call(item["name"], args_str, match.group(0))
+                    else:
+                        valid_array = False
+                if valid_array and arr:
+                    remaining_text = remaining_text.replace(match.group(0), "").strip()
+        except json.JSONDecodeError:
+            continue
+    
+    # Strategy 2: Parse individual JSON objects (more lenient)
+    # Match {"name": "...", "arguments": {...}} patterns
+    json_patterns = [
+        # Standard format
+        r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}',
+        # Reversed order
+        r'\{\s*"arguments"\s*:\s*(\{[^{}]*\})\s*,\s*"name"\s*:\s*"([^"]+)"\s*\}',
+    ]
+    
+    for pattern in json_patterns:
+        for match in re.finditer(pattern, text, re.DOTALL):
+            try:
+                if "arguments" in pattern[:30]:  # Reversed pattern
+                    fn_args, fn_name = match.group(1), match.group(2)
+                else:
+                    fn_name, fn_args = match.group(1), match.group(2)
+                
+                # Validate arguments JSON
+                json.loads(fn_args)
+                
+                if add_tool_call(fn_name, fn_args, match.group(0)):
+                    remaining_text = remaining_text.replace(match.group(0), "").strip()
+            except (json.JSONDecodeError, Exception):
+                continue
+    
+    # Strategy 3: Parse code blocks with JSON
+    code_block_patterns = [
+        r'```json\s*([\s\S]*?)\s*```',
+        r'```\s*([\s\S]*?)\s*```',
+    ]
+    
+    for pattern in code_block_patterns:
+        for match in re.finditer(pattern, text, re.DOTALL):
+            try:
+                json_str = match.group(1).strip()
+                parsed = json.loads(json_str)
+                
+                # Handle both single object and array
+                items = parsed if isinstance(parsed, list) else [parsed]
+                
+                for item in items:
+                    if isinstance(item, dict) and "name" in item:
+                        args = item.get("arguments", {})
+                        args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                        if add_tool_call(item["name"], args_str, match.group(0)):
+                            remaining_text = remaining_text.replace(match.group(0), "").strip()
+            except (json.JSONDecodeError, Exception):
+                continue
+    
+    # Clean up remaining text
+    remaining_text = re.sub(r'\s+', ' ', remaining_text).strip()
+    
+    return remaining_text, tool_calls
+
+
+def detect_incomplete_tool_call(text: str) -> bool:
+    """
+    Detect if the model output contains an incomplete tool call JSON.
+    Used for retry logic.
+    """
+    # Check for unclosed braces/brackets that look like tool calls
+    if '{"name"' in text or "[{" in text:
+        open_braces = text.count('{') - text.count('}')
+        open_brackets = text.count('[') - text.count(']')
+        if open_braces > 0 or open_brackets > 0:
+            return True
+    return False
+
+
+def get_retry_prompt() -> str:
+    """Get a prompt to fix malformed tool call output."""
+    return """Your previous response contained a malformed tool call. Please try again.
+Output ONLY valid JSON in this format:
+{"name": "function_name", "arguments": {"param": "value"}}"""
+
+
+def _format_chatml_message(message: ChatMessage) -> str:
+    """Format a single message into a ChatML block."""
+    content = message.content or ""
+
+    if message.role == "tool" and message.tool_call_id:
+        return (
+            f"<|im_start|>tool\n"
+            f"Call ID: {message.tool_call_id}\n"
+            f"Result: {content}\n"
+            f"<|im_end|>\n"
+        )
+
+    if message.role == "assistant" and message.tool_calls:
+        tool_calls_formatted = []
+        for tool_call in message.tool_calls:
+            fn = tool_call.get("function", {})
+            tool_calls_formatted.append({
+                "id": tool_call.get("id", ""),
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", "{}")
+            })
+        return f"<|im_start|>assistant\n{json.dumps(tool_calls_formatted)}<|im_end|>\n"
+
+    return f"<|im_start|>{message.role}\n{content}<|im_end|>\n"
+
+
+def _encode_len(tokenizer, text: str) -> int:
+    """Return the token length for a text snippet."""
+    encoded = tokenizer.encode(text, return_tensors="pt")
+    if hasattr(encoded, "shape"):
+        if len(encoded.shape) == 1:
+            return int(encoded.shape[0])
+        return int(encoded.shape[1])
+    return int(len(encoded))
+
+
+def _truncate_text_to_tokens(tokenizer, text: str, max_tokens: int) -> str:
+    """Truncate text to the first max_tokens tokens."""
+    if max_tokens <= 0:
+        return ""
+
+    encoded = tokenizer.encode(text, return_tensors="pt")
+    if hasattr(encoded, "shape") and len(encoded.shape) > 1:
+        return tokenizer.decode(encoded[0][:max_tokens], skip_special_tokens=False)
+    return tokenizer.decode(encoded[:max_tokens], skip_special_tokens=False)
+
+
+def build_prompt_sliding_window(
+    messages: List[ChatMessage],
+    tokenizer,
+    max_prompt_len: int,
+    system_override: str = "",
+) -> tuple[str, int, int, list]:
+    """
+    Build a ChatML prompt that fits within max_prompt_len tokens using a
+    sliding window strategy.
+
+    Strategy:
+    1. Always include the system message (tools injection or user system prompt)
+    2. Always include the LAST (most recent) user message
+    3. Fill remaining token budget with as many prior turns as possible,
+       working backwards from the newest message
+    4. Never truncate mid-message — drop whole turns only
+
+    Returns (prompt_string, token_count).
+    """
+    assistant_marker = "<|im_start|>assistant\n"
+    assistant_tokens = _encode_len(tokenizer, assistant_marker)
+    remaining_budget = max(max_prompt_len - assistant_tokens, 0)
+
+    system_block = ""
+    system_index: Optional[int] = None
+
+    if system_override:
+        system_block = f"<|im_start|>system\n{system_override}<|im_end|>\n"
+        if messages and messages[0].role == "system":
+            system_index = 0
+    elif messages and messages[0].role == "system":
+        system_index = 0
+        system_block = _format_chatml_message(messages[0])
+
+    if system_block:
+        system_tokens = _encode_len(tokenizer, system_block)
+        if system_tokens > remaining_budget:
+            logger.warning(
+                "System block exceeded prompt budget; truncating system prompt to fit the reserved assistant marker"
+            )
+            system_block = _truncate_text_to_tokens(tokenizer, system_block, remaining_budget)
+            system_tokens = _encode_len(tokenizer, system_block)
+        remaining_budget = max(remaining_budget - system_tokens, 0)
+
+    last_user_index = next(
+        (
+            idx for idx in range(len(messages) - 1, -1, -1)
+            if idx != system_index and messages[idx].role == "user"
+        ),
+        None,
+    )
+
+    last_user_block = ""
+    last_user_tokens = 0
+    if last_user_index is not None:
+        last_user_block = _format_chatml_message(messages[last_user_index])
+        last_user_tokens = _encode_len(tokenizer, last_user_block)
+
+        if system_block and last_user_tokens > remaining_budget:
+            target_system_budget = max(max_prompt_len - assistant_tokens - last_user_tokens, 0)
+            if target_system_budget < _encode_len(tokenizer, system_block):
+                logger.warning(
+                    "Truncating system prompt further to preserve the most recent user turn in the sliding window"
+                )
+                system_block = _truncate_text_to_tokens(tokenizer, system_block, target_system_budget)
+                remaining_budget = max(max_prompt_len - assistant_tokens - _encode_len(tokenizer, system_block), 0)
+
+    candidate_indices = [
+        idx for idx in range(len(messages) - 1, -1, -1)
+        if idx != system_index
+    ]
+
+    selected_blocks_reversed: List[str] = []
+    selected_indices_reversed: List[int] = []
+    last_user_included = last_user_index is None
+    dropped_turns = 0
+
+    for position, idx in enumerate(candidate_indices):
+        block = _format_chatml_message(messages[idx])
+        block_tokens = _encode_len(tokenizer, block)
+        reserved_budget = 0
+
+        if last_user_index is not None and not last_user_included and idx != last_user_index:
+            reserved_budget = last_user_tokens
+
+        if block_tokens + reserved_budget <= remaining_budget:
+            selected_blocks_reversed.append(block)
+            selected_indices_reversed.append(idx)
+            remaining_budget -= block_tokens
+            if idx == last_user_index:
+                last_user_included = True
+            continue
+
+        dropped_turns += 1
+
+        if last_user_index is not None and not last_user_included and idx > last_user_index:
+            continue
+
+        dropped_turns += len(candidate_indices) - position - 1
+        break
+
+    selected_blocks = list(reversed(selected_blocks_reversed))
+    selected_indices = list(reversed(selected_indices_reversed))
+
+    prompt = system_block + "".join(selected_blocks) + assistant_marker
+    input_length = _encode_len(tokenizer, prompt)
+
+    while input_length > max_prompt_len and selected_blocks:
+        dropped_turns += 1
+        # pop the oldest selected block (front of selected_blocks)
+        removed_idx = selected_indices.pop(0)
+        selected_blocks.pop(0)
+        prompt = system_block + "".join(selected_blocks) + assistant_marker
+        input_length = _encode_len(tokenizer, prompt)
+
+    if input_length > max_prompt_len and system_block:
+        system_budget = max(max_prompt_len - assistant_tokens, 0)
+        system_block = _truncate_text_to_tokens(tokenizer, system_block, system_budget)
+        prompt = system_block + "".join(selected_blocks) + assistant_marker
+        input_length = _encode_len(tokenizer, prompt)
+
+    # compute dropped messages (chronological order)
+    dropped_indices = [i for i in range(len(messages)) if i != system_index and i not in selected_indices]
+    dropped_messages = [messages[i] for i in dropped_indices]
+
+    if dropped_turns > 0:
+        logger.info(
+            f"Sliding window: dropped {dropped_turns} older turn(s) to fit {max_prompt_len} token budget"
+        )
+
+    return prompt, input_length, dropped_turns, dropped_messages
+
+
+# --- Routes ---
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    model, tokenizer = get_model_and_tokenizer(request.model)
+    max_context_len, max_prompt_len = get_model_context_limits(request.model)
+    
+    MAX_RETRY_ATTEMPTS = 2  # For malformed tool calls
+    
+    # Always include built-in file system tools
+    builtin_tools = get_builtin_file_tools()
+    all_tools = list((request.tools or [])) + builtin_tools
+    
+    # Check if tools are disabled via tool_choice
+    use_tools = all_tools and request.tool_choice != "none"
+
+    system_override = ""
+    if use_tools:
+        tools_prompt = format_tools_for_prompt(all_tools, request.tool_choice)
+        if tools_prompt:
+            system_override = tools_prompt
+
+    # Inject long-term memory scoped to THIS conversation. Memory only exists for a
+    # conversation once it has grown long enough to drop turns, so this naturally avoids
+    # leaking unrelated summaries into fresh chats.
+    try:
+        mem_entries = _load_memory_store(getattr(request, "conversation_id", None))
+        if mem_entries:
+            recent = mem_entries[-3:]  # most recent summaries for this conversation
+            mem_text = "Long-term memory (earlier in this conversation):\n" + "\n".join(
+                [f"- {e.get('summary', '')[:280]}" for e in recent]
+            )
+            system_override = mem_text + ("\n\n" + system_override if system_override else "")
+    except Exception:
+        logger.exception('Failed to load memories for inclusion')
+
+    prompt, input_length, dropped_turns, dropped_messages = build_prompt_sliding_window(
+        messages=request.messages,
+        tokenizer=tokenizer,
+        max_prompt_len=max_prompt_len,
+        system_override=system_override,
+    )
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+
+    # If turns were dropped, schedule a background model-based summarization task
+    try:
+        if dropped_messages:
+            conv_id = getattr(request, "conversation_id", None)
+            try:
+                asyncio.create_task(_async_summarize_and_append(dropped_messages, request.model, conv_id))
+            except RuntimeError:
+                # If there's no running loop, fall back to synchronous append
+                _append_memory_entry(dropped_messages, request.model, conv_id)
+    except Exception:
+        logger.exception('Failed to schedule or append dropped turns to memory store')
+
+    # Cap max_new_tokens to stay within context limit
+    available_tokens = max_context_len - input_length - 10
+    max_new_tokens = min(request.max_tokens or 512, available_tokens, 500)
+    max_new_tokens = max(max_new_tokens, 10)
+    
+    # Generation config for NPU
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+    )
+
+    # --- Streaming Response with Tool Call Detection ---
+    if request.stream:
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        gen_kwargs["streamer"] = streamer
+        
+        async def generate_with_lock():
+            global is_generating
+            # Serialize across models: the NPU is one shared device.
+            async with npu_generation_semaphore:
+                async with get_model_lock(request.model):
+                    is_generating = True
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(None, lambda: model.generate(input_ids, **gen_kwargs))
+                    except Exception as e:
+                        logger.error(f"Generation failed: {e}")
+                    finally:
+                        is_generating = False
+        
+        # Start generation in a background task
+        asyncio.create_task(generate_with_lock())
+
+        async def stream_generator():
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            accumulated_text = ""
+            buffered_chunks: List[str] = []
+            
+            for text in streamer:
+                accumulated_text += text
+                buffered_chunks.append(text)
+            
+            finish_reason = "stop"
+            _, parsed_tools = (accumulated_text, [])
+            if use_tools:
+                _, parsed_tools = parse_tool_calls(accumulated_text, all_tools)
+
+            if parsed_tools:
+                finish_reason = "tool_calls"
+
+                initial_chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": None},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(initial_chunk)}\n\n"
+
+                for i, tc in enumerate(parsed_tools):
+                    tool_chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": i,
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments
+                                    }
+                                }]
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {json.dumps(tool_chunk)}\n\n"
+            else:
+                for text in buffered_chunks:
+                    chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+            
+            # Calculate completion tokens unconditionally
+            completion_tokens = len(tokenizer.encode(accumulated_text))
+            
+            # Send the normal finish chunk
+            end_chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            }
+            yield f"data: {json.dumps(end_chunk)}\n\n"
+            
+            # OpenAI specification: yield one final chunk with an empty choices array and the usage object
+            if request.stream_options and request.stream_options.include_usage:
+                usage_chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": input_length,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": input_length + completion_tokens,
+                        "context": {
+                            "max_prompt_len": max_prompt_len,
+                            "max_context_len": max_context_len,
+                            "input_length": input_length,
+                            "available_prompt_tokens": max_prompt_len - input_length,
+                            "dropped_turns": dropped_turns
+                        }
+                    }
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+                
+            yield "data: [DONE]\n\n"
+
+            # Persist the completed turn server-side (best-effort)
+            try:
+                _persist_turn(request, accumulated_text)
+            except Exception:
+                logger.exception("Failed to persist streaming conversation")
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    # --- Standard Response with Retry Logic ---
+    else:
+        generated_text = ""
+        retry_count = 0
+        current_input_ids = input_ids
+        global is_generating  # Must be declared at function scope, not inside loops
+        
+        while retry_count <= MAX_RETRY_ATTEMPTS:
+            async with npu_generation_semaphore:
+                async with get_model_lock(request.model):
+                    is_generating = True
+                    try:
+                        with torch.no_grad():
+                            output_ids = await asyncio.get_running_loop().run_in_executor(
+                                None,
+                                lambda: model.generate(current_input_ids, **gen_kwargs)
+                            )
+                    finally:
+                        is_generating = False
+            
+            generated_text = tokenizer.decode(output_ids[0][current_input_ids.shape[1]:], skip_special_tokens=True)
+            
+            # Check if we need tools and got malformed output
+            if use_tools and detect_incomplete_tool_call(generated_text):
+                retry_count += 1
+                if retry_count <= MAX_RETRY_ATTEMPTS:
+                    logger.warning(f"Malformed tool call detected, retry {retry_count}/{MAX_RETRY_ATTEMPTS}")
+                    retry_messages = list(request.messages) + [
+                        ChatMessage(role="assistant", content=generated_text),
+                        ChatMessage(role="user", content=get_retry_prompt()),
+                    ]
+                    retry_prompt, _, _, _ = build_prompt_sliding_window(
+                        messages=retry_messages,
+                        tokenizer=tokenizer,
+                        max_prompt_len=max_prompt_len,
+                        system_override=system_override,
+                    )
+                    current_input_ids = tokenizer.encode(retry_prompt, return_tensors="pt")
+                    continue
+            break
+        
+        # Parse tool calls if tools were requested
+        tool_calls_list = None
+        finish_reason = "stop"
+        response_content = generated_text
+        
+        if use_tools:
+            remaining_text, parsed_tool_calls = parse_tool_calls(generated_text, all_tools)
+            if parsed_tool_calls:
+                tool_calls_list = parsed_tool_calls
+                finish_reason = "tool_calls"
+                response_content = remaining_text if remaining_text else None
+                logger.info(f"Parsed {len(parsed_tool_calls)} tool call(s)")
+
+        # Persist the completed turn server-side (canonical store)
+        _persist_turn(request, response_content)
+
+        # Calculate tokens
+        prompt_tokens = input_length
+        completion_tokens = int(output_ids.shape[1] - current_input_ids.shape[1])
+        
+        return ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4()}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatCompletionMessageWithTools(
+                        role="assistant", 
+                        content=response_content,
+                        tool_calls=tool_calls_list
+                    ),
+                    finish_reason=finish_reason
+                )
+            ],
+            usage=UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens
+            )
+        )
+
+@app.post("/v1/responses")
+async def create_response(request: ResponseRequest):
+    """
+    OpenAI Responses API endpoint (for N8N compatibility).
+    Converts Responses API format to internal format and returns response.
+    """
+    model, tokenizer = get_model_and_tokenizer(request.model)
+    max_context_len, max_prompt_len = get_model_context_limits(request.model)
+    
+    # Convert input to prompt
+    # Input can be a string or a list of messages
+    if isinstance(request.input, str):
+        # Simple string input
+        prompt = ""
+        if request.instructions:
+            prompt += f"<|im_start|>system\n{request.instructions}<|im_end|>\n"
+        prompt += f"<|im_start|>user\n{request.input}<|im_end|>\n"
+        prompt += "<|im_start|>assistant\n"
+    elif isinstance(request.input, list):
+        # List of messages
+        prompt = ""
+        if request.instructions:
+            prompt += f"<|im_start|>system\n{request.instructions}<|im_end|>\n"
+        for msg in request.input:
+            if isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+        prompt += "<|im_start|>assistant\n"
+    else:
+        raise HTTPException(status_code=400, detail="Input must be a string or list of messages")
+    
+    # Encode and check length
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    input_length = input_ids.shape[1]
+    
+    # Truncate if too long
+    if input_length > max_prompt_len:
+        input_ids = input_ids[:, -max_prompt_len:]
+        input_length = max_prompt_len
+        logger.warning(f"Input truncated to {max_prompt_len} tokens")
+    
+    # Cap max tokens
+    available_tokens = max_context_len - input_length - 10
+    max_new_tokens = min(request.max_output_tokens or 512, available_tokens, 500)
+    max_new_tokens = max(max_new_tokens, 10)
+    
+    # Generation config
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+    )
+    
+    # Generate response
+    global is_generating
+    async with npu_generation_semaphore:
+        async with get_model_lock(request.model):
+            is_generating = True
+            try:
+                with torch.no_grad():
+                    output_ids = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: model.generate(input_ids, **gen_kwargs)
+                    )
+            finally:
+                is_generating = False
+    
+    generated_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
+    completion_tokens = int(output_ids.shape[1] - input_ids.shape[1])
+    
+    # Build Responses API format response
+    response_id = f"resp-{uuid.uuid4()}"
+    message_id = f"msg-{uuid.uuid4()}"
+    
+    return ResponseObject(
+        id=response_id,
+        created_at=int(time.time()),
+        model=request.model,
+        output=[
+            ResponseOutputMessage(
+                id=message_id,
+                content=[{"type": "output_text", "text": generated_text}]
+            )
+        ]
+    )
+
+@app.get("/v1/models")
+async def list_models():
+    """Return list of available models for OpenAI API compatibility."""
+    models_list = []
+    for model_id, data in loaded_models.items():
+        model_info = AVAILABLE_MODELS.get(model_id, {})
+        models_list.append({
+            "id": model_id,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "intel-npu",
+            "name": model_info.get("name", model_id),
+            "description": model_info.get("description", "")
+        })
+    
+    return {"object": "list", "data": models_list}
+
+
+@app.post("/v1/models/load")
+async def load_model(request: ModelLoadRequest):
+    """Queue a model for local download/compile/load if needed."""
+    if request.model not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{request.model}'")
+
+    task = schedule_model_load(request.model)
+    model_entry = get_model_catalog_entry(request.model)
+
+    if task is None and model_entry["is_loaded"]:
+        return {
+            "status": "loaded",
+            "message": f"{model_entry['name']} is already ready.",
+            "model": model_entry
+        }
+
+    return {
+        "status": model_entry["status"],
+        "message": f"Loading {model_entry['name']} locally. This can take a while on first run.",
+        "model": model_entry
+    }
+
+
+@app.post("/v1/models/unload")
+async def unload_model(request: ModelUnloadRequest):
+    """Unload a specific model from memory while keeping local disk caches."""
+    if request.model not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{request.model}'")
+
+    if request.model not in loaded_models:
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is not currently loaded")
+
+    task = model_load_tasks.get(request.model)
+    if task and not task.done():
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is still loading")
+
+    model_lock = model_locks.get(request.model)
+    if model_lock and model_lock.locked():
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is busy and cannot be unloaded right now")
+
+    unloaded = unload_model_from_memory(request.model)
+    model_entry = get_model_catalog_entry(request.model)
+
+    if not unloaded:
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is not currently loaded")
+
+    return {
+        "status": "unloaded",
+        "message": f"Unloaded {model_entry['name']} from memory.",
+        "model": model_entry
+    }
+
+
+@app.post("/v1/models/delete")
+async def delete_model(request: ModelDeleteRequest):
+    """Delete cached artifacts for a specific model from local disk."""
+    if request.model not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{request.model}'")
+
+    if request.model in loaded_models:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Model '{request.model}' is currently loaded. Restart the server without it before deleting."
+        )
+
+    task = model_load_tasks.get(request.model)
+    if task and not task.done():
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is still loading")
+
+    model_info = AVAILABLE_MODELS[request.model]
+    hf_id = model_info["hf_id"]
+    npu_cache_dir = get_npu_cache_dir(hf_id)
+    hf_repo_dir = get_hf_repo_dir(hf_id)
+
+    try:
+        freed_bytes = 0
+        deleted_npu_cache = False
+        deleted_hf_cache = False
+
+        if npu_cache_dir.exists():
+            freed_bytes += _delete_path_if_exists(npu_cache_dir, Path(NPU_MODEL_CACHE))
+            deleted_npu_cache = True
+
+        if hf_repo_dir.exists():
+            freed_bytes += _delete_path_if_exists(hf_repo_dir, Path(get_hf_home_dir()) / "hub")
+            deleted_hf_cache = True
+
+        clear_model_status(request.model)
+        model_load_tasks.pop(request.model, None)
+
+        model_entry = get_model_catalog_entry(request.model)
+        if not deleted_npu_cache and not deleted_hf_cache:
+            return {
+                "status": "noop",
+                "message": f"No local cache was found for {model_entry['name']}.",
+                "freed_bytes": 0,
+                "freed_gb": 0.0,
+                "deleted": {
+                    "npu_cache": False,
+                    "hf_cache": False,
+                },
+                "model": model_entry
+            }
+
+        freed_gb = round(freed_bytes / (1024 ** 3), 2)
+        return {
+            "status": "deleted",
+            "message": f"Deleted local cache for {model_entry['name']}.",
+            "freed_bytes": freed_bytes,
+            "freed_gb": freed_gb,
+            "deleted": {
+                "npu_cache": deleted_npu_cache,
+                "hf_cache": deleted_hf_cache,
+            },
+            "model": model_entry
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Failed to delete model '{request.model}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete model '{request.model}'")
+
+@app.get("/health")
+async def health():
+    if not models_ready.is_set():
+        return {"status": "loading", "models_loaded": 0, "ready": False}
+    return {
+        "status": "ok",
+        "ready": True,
+        "models_loaded": len(loaded_models),
+        "auth_required": bool(API_KEY),
+    }
+
+# --- File system access endpoints ---
+@app.post("/v1/fs/set-working-dir")
+async def set_working_dir(request: dict):
+    """Set the working directory for file operations."""
+    global WORKING_DIR
+    try:
+        new_path = Path(request.get("path", ".")).resolve()
+        if not new_path.is_dir():
+            raise HTTPException(status_code=400, detail=f"Not a directory: {new_path}")
+        WORKING_DIR = new_path
+        return {"success": True, "working_dir": str(WORKING_DIR)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/v1/fs/working-dir")
+async def get_working_dir():
+    """Get current working directory."""
+    return {"working_dir": str(WORKING_DIR)}
+
+@app.post("/v1/fs/list")
+async def fs_list(request: dict):
+    """List files/directories in a path."""
+    path = request.get("path", ".")
+    result = _list_files_tool(path)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+@app.post("/v1/fs/read")
+async def fs_read(request: dict):
+    """Read file contents."""
+    file_path = request.get("file_path")
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path required")
+    result = _read_file_tool(file_path)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+@app.post("/v1/fs/write")
+async def fs_write(request: dict):
+    """Write/create a file."""
+    file_path = request.get("file_path")
+    content = request.get("content", "")
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path required")
+    result = _write_file_tool(file_path, content)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+@app.post("/v1/fs/edit")
+async def fs_edit(request: dict):
+    """Edit file (replace text)."""
+    file_path = request.get("file_path")
+    old_str = request.get("old_str")
+    new_str = request.get("new_str")
+    if not file_path or old_str is None:
+        raise HTTPException(status_code=400, detail="file_path and old_str required")
+    result = _edit_file_tool(file_path, old_str, new_str or "")
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+def _dir_size_gb(path: str) -> float:
+    """Return total size of a directory in GB, or 0.0 if it doesn't exist."""
+    total = 0
+    try:
+        for dirpath, _, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return round(total / (1024**3), 2)
+
+@app.get("/v1/system/status")
+async def system_status():
+    """Return system resource usage including model disk footprint."""
+    vm = psutil.virtual_memory()
+
+    # Disk sizes
+    npu_cache_gb = _dir_size_gb(NPU_MODEL_CACHE)
+    hf_home = get_hf_home_dir()
+    hf_hub_path = os.path.join(hf_home, "hub")
+    hf_cache_gb = _dir_size_gb(hf_hub_path)
+    available_models = [get_model_catalog_entry(model_id) for model_id in AVAILABLE_MODELS]
+    loading_count = sum(1 for model in available_models if model["is_loading"])
+
+    return {
+        "memory": {
+            "total_gb": round(vm.total / (1024**3), 2),
+            "available_gb": round(vm.available / (1024**3), 2),
+            "used_percent": vm.percent
+        },
+        "cpu": {
+            "percent": psutil.cpu_percent(interval=None)
+        },
+        "models": {
+            "loaded": list(loaded_models.keys()),
+            "count": len(loaded_models),
+            "loading_count": loading_count,
+            "available": available_models
+        },
+        "npu": {
+            "config": os.environ.get("IPEX_LLM_NPU_MTL", "non-MTL"),
+            "busy": any(lock.locked() for lock in model_locks.values()) or npu_resource_lock.locked(),
+            "model_locks": {
+                mid: model_locks[mid].locked()
+                for mid in model_locks
+            }
+        },
+        "disk": {
+            "npu_cache_gb": npu_cache_gb,
+            "hf_cache_gb": hf_cache_gb,
+            "total_gb": round(npu_cache_gb + hf_cache_gb, 2)
+        }
+    }
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Intel NPU LLM Server")
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="qwen1.5-1.8b",
+        help="Comma-separated list of models to load (e.g., 'qwen1.5-1.8b,qwen2-1.5b,deepseek-1.5b')"
+    )
+    
+    # Use PORT environment variable as default if available
+    default_port = int(os.environ.get("PORT", 8000))
+    parser.add_argument("--port", type=int, default=default_port, help=f"Port to run server on (default: {default_port})")
+    parser.add_argument("--list", action="store_true", help="List available models and exit")
+    parser.add_argument("--check-env", action="store_true", help="Validate the Intel NPU Python environment and exit")
+    args = parser.parse_args()
+    
+    if args.list:
+        print("\nAvailable Models:")
+        print("-" * 60)
+        for model_id, info in AVAILABLE_MODELS.items():
+            print(f"  {model_id:15} - {info['name']}")
+            print(f"                    {info['description']}")
+            print(f"                    HF: {info['hf_id']}")
+            print()
+        exit(0)
+
+    if args.check_env:
+        ensure_runtime_dependencies(raise_on_error=True)
+        print_runtime_summary()
+        exit(0)
+
+    ensure_runtime_dependencies(raise_on_error=True)
+    
+    # Parse model list
+    model_ids_to_load = [m.strip() for m in args.models.split(",") if m.strip()]
+
+    logger.info(f"Server starting! Visit: http://localhost:{args.port}")
+    logger.info(f"Models requested: {', '.join(model_ids_to_load)}")
+    
+    # Bind to all interfaces (0.0.0.0) but uvicorn will still log 0.0.0.0 by default.
+    # To avoid confusing the user, we print a clear URL above.
+    uvicorn.run(app, host="0.0.0.0", port=args.port)

@@ -1,0 +1,22 @@
+{
+  "id": "chatcmpl-2d487518-d96e-454f-9d06-370faab6b6a0",
+  "object": "chat.completion",
+  "created": 1783949080,
+  "model": "qwen1.5-1.8b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Here are some additional sentences that could be included in the long message:\n\n- \"The sun sets over the horizon, casting a warm glow across the landscape.\"\n- \"The wind whispers through the trees, rustling the leaves and creating a symphony of",
+        "tool_calls": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 492,
+    "completion_tokens": 50,
+    "total_tokens": 542
+  }
+}
