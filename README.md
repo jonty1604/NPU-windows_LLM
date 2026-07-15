@@ -17,12 +17,6 @@ OpenAI-compatible API. No cloud, no GPU — just the AI Boost chip that's alread
 - **Stays local** — everything runs on your machine; nothing is sent anywhere unless you point it
   at a remote service yourself.
 
-## Demos
-
-| Quick overview & speed test | Feature deep dive |
-| :---: | :---: |
-| [![UI & performance demo](https://img.youtube.com/vi/00RTemT1Bbs/0.jpg)](https://www.youtube.com/watch?v=00RTemT1Bbs) | [![Building with Intel NPU & the OpenAI API](https://img.youtube.com/vi/6F6LbR2Xjcg/0.jpg)](https://www.youtube.com/watch?v=6F6LbR2Xjcg) |
-
 ## Requirements
 
 - **CPU**: Intel Core Ultra with an NPU / AI Boost device. Meteor Lake, Arrow Lake, and Lunar
@@ -516,7 +510,3 @@ npu-windows/
     ├── .env.example             # Environment variable template
     └── npu_model_cache/         # Compiled NPU models (created on first run)
 ```
-
-## License
-
-MIT
