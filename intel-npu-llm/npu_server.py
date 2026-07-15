@@ -695,19 +695,30 @@ CONTEXT_PROFILES = {
     "large":  (4096, 2048),
 }
 
+# Tokens to keep free for generation after the prompt. The sliding window trims the prompt
+# down to max_prompt_len, but generation still has to fit in max_context_len — so the prompt
+# must never be allowed to grow large enough to leave no room for output. Without this reserve,
+# a max_prompt_len close to max_context_len (e.g. 512 of 1024) lets prompt + generated tokens
+# overflow max_context_len and the NPU rejects the request.
+RESERVED_FOR_GENERATION = 600
+
 
 def get_model_context_limits(model_id: str) -> tuple[int, int]:
     """Return (max_context_len, max_prompt_len) for a given model.
 
     Resolution order: explicit max_context_len/max_prompt_len > named context_profile > defaults.
+    max_prompt_len is clamped so it never consumes the whole context window — at least
+    RESERVED_FOR_GENERATION tokens are always left for generation, preventing
+    "Input plus output tokens should not exceed max_context_len" on long chats.
     """
     model_cfg = AVAILABLE_MODELS.get(model_id, {})
     profile = model_cfg.get("context_profile")
     prof_ctx, prof_prompt = CONTEXT_PROFILES.get(profile, (DEFAULT_MAX_CONTEXT_LEN, DEFAULT_MAX_PROMPT_LEN))
-    return (
-        model_cfg.get("max_context_len", prof_ctx),
-        model_cfg.get("max_prompt_len", prof_prompt),
-    )
+    max_context_len = int(model_cfg.get("max_context_len", prof_ctx))
+    requested_prompt_len = int(model_cfg.get("max_prompt_len", prof_prompt))
+    # Leave room for a reply; never let the prompt eat the entire context budget.
+    max_prompt_len = min(requested_prompt_len, max(0, max_context_len - RESERVED_FOR_GENERATION))
+    return max_context_len, max_prompt_len
 
 
 def get_model_lock(model_id: str) -> asyncio.Lock:
